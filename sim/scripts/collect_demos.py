@@ -1,0 +1,107 @@
+"""Collect demonstration episodes by rolling the scripted expert.
+
+Example:
+
+    uv run python -m sim.scripts.collect_demos \
+        --repo-id local/safe-cube-demos \
+        --root data/safe_cube_demos \
+        --n-episodes 50
+
+Writes a LeRobotDataset. Failures (red contact, ceiling violation, blue drop)
+are *kept* — they're the negative class the safety loss needs. Use the
+`--successes-only` flag if you want the clean BC warm-start set.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import numpy as np
+
+from sim.configs import EnvConfig, ExpertConfig, SceneConfig
+from sim.env import SafeCubeEnv
+from sim.expert import ScriptedExpert
+from sim.recorder import EpisodeRecorder
+
+TASK_DESCRIPTION = (
+    "pick up the blue cube, carry it low across the table avoiding every red cube, "
+    "and place it on the green goal patch"
+)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--repo-id", required=True)
+    p.add_argument("--root", type=Path, default=None)
+    p.add_argument("--mjcf", type=str, default=SceneConfig().mjcf_path,
+                   help="path to SO-101 MJCF (see sim/assets/README.md)")
+    p.add_argument("--n-episodes", type=int, default=50)
+    p.add_argument("--n-red-cubes", type=int, default=8)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--max-steps", type=int, default=400)
+    p.add_argument("--successes-only", action="store_true",
+                   help="discard episodes that fail (red contact / drop / timeout)")
+    p.add_argument("--use-videos", action="store_true", default=True)
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    scene = SceneConfig(mjcf_path=args.mjcf, n_red_cubes=args.n_red_cubes)
+    env = SafeCubeEnv(EnvConfig(scene=scene, max_episode_steps=args.max_steps, seed=args.seed))
+    # Reset once to lock in action_dim / state_dim.
+    obs, info = env.reset(seed=args.seed)
+    state_dim = obs["state"].shape[0]
+
+    rec = EpisodeRecorder.create(
+        repo_id=args.repo_id,
+        root=args.root,
+        n_red_cubes=args.n_red_cubes,
+        image_size=scene.image_size,
+        action_dim=env.action_dim,
+        state_dim=state_dim,
+        fps=env.cfg.fps,
+        use_videos=args.use_videos,
+    )
+
+    expert = ScriptedExpert(env=env, cfg=ExpertConfig())
+
+    saved = 0
+    discarded = 0
+    for ep in range(args.n_episodes):
+        if ep > 0:
+            obs, info = env.reset(seed=args.seed + ep)
+        expert.reset()
+        rec.begin_episode(task=TASK_DESCRIPTION)
+        terminated = truncated = False
+        settle_budget = max(int(env.cfg.fps), env.cfg.success_dwell_steps + 5)
+        settle_left = settle_budget
+        while not (terminated or truncated):
+            if expert.done():
+                if settle_left <= 0:
+                    break
+                settle_left -= 1
+                # Hold pose with gripper OPEN — see note in record_rollout.py.
+                action = np.concatenate([env.joint_positions(),
+                                          np.array([ExpertConfig().grip_open])])
+            else:
+                action = expert.act(info)
+            rec.add(obs, action, info)
+            obs, _, terminated, truncated, info = env.step(action)
+        stats = info["stats"]
+        if args.successes_only and not stats["success"]:
+            rec.discard_episode()
+            discarded += 1
+        else:
+            n = rec.save_episode()
+            saved += 1
+            print(f"[ep {ep:03d}] frames={n} stats={stats}")
+    env.close()
+    rec.finalize()
+    print(f"\nDone. saved={saved}  discarded={discarded}  -> {args.root or '$HF_LEROBOT_HOME'}")
+
+
+if __name__ == "__main__":
+    main()

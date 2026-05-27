@@ -1,0 +1,526 @@
+"""Compose a MuJoCo scene by loading the SO-101 URDF and procedurally adding
+cubes, goal patch, camera, lights, table, and actuators via MjSpec.
+
+The URDF lives at sim/assets/so101/so101_new_calib.urdf (see sim/assets/README.md).
+URDFs don't carry MuJoCo-only constructs (actuators, cameras, sites), so we
+build the full scene through MjSpec then call spec.compile() to get an MjModel.
+
+Layout sampling (per project spec):
+    - Blue cube on the LEFT (+y) side of the arm — small sampled region.
+    - Goal patch FIXED on the RIGHT (-y) side.
+    - 6 red cubes inside an 8x8 inch obstacle field between blue and goal.
+    - After sampling, a BFS path check rejects layouts where no collision-free
+      carry path exists from blue to goal; we then resample.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import mujoco
+import numpy as np
+
+from .configs import SceneConfig
+
+
+@dataclass
+class CubeSpec:
+    name: str
+    pos: np.ndarray            # (3,)
+    half: float
+    rgba: tuple[float, float, float, float]
+
+
+@dataclass
+class Layout:
+    red_cubes: list[CubeSpec]
+    blue_cube: CubeSpec
+    goal_xy: np.ndarray        # (2,)
+    # XY waypoints from blue→goal that avoid every red cube by ≥
+    # path_clearance_radius. Populated by the BFS planner. The expert
+    # follows these directly during CARRY; the policy learns from the
+    # resulting imitation, not from the waypoints.
+    carry_waypoints: list[np.ndarray] = field(default_factory=list)
+
+
+# Position-control gains (tuned for SO-101 scale). Halved Kp + lower Kd
+# slows arm motion ~2x — smoother to watch, no overshoot or oscillation.
+_KP = 75.0
+_KD = 4.0
+_FORCE_LIMIT = 30.0  # N·m — generous for sim; ignores real STS3215 torque limits.
+
+# Non-world arm bodies after URDF→MjSpec conversion. The URDF parser flattens
+# `base_link` geoms directly into the world body (without a name), so we also
+# treat un-named geoms attached to world (that aren't our floor / table /
+# cubes) as part of the arm base for collision-masking purposes.
+_ARM_BODIES = frozenset({
+    "shoulder_link",
+    "upper_arm_link",
+    "lower_arm_link",
+    "wrist_link",
+    "gripper_link",
+    "moving_jaw_so101_v1_link",
+})
+_NON_ARM_WORLD_GEOMS = frozenset({
+    "floor", "table_plane",
+    "zone_edge_north", "zone_edge_south", "zone_edge_east", "zone_edge_west",
+    "goal_tape_north", "goal_tape_south", "goal_tape_east", "goal_tape_west",
+})
+# Joint damping / armature added on top of the URDF (URDF carries neither, so the
+# resulting system is grossly underdamped without these).
+_JOINT_DAMPING = 2.0
+_JOINT_ARMATURE = 0.01
+
+
+def _find_path(
+    reds: list[np.ndarray], blue_xy: np.ndarray, goal_xy: np.ndarray, *,
+    clearance: float, grid_res: float,
+    bounds_x: tuple[float, float], bounds_y: tuple[float, float],
+    waypoint_stride: int = 6,
+) -> list[np.ndarray] | None:
+    """BFS over a 2D grid. Returns a list of (x, y) world-frame waypoints
+    leading blue→goal while staying ≥ `clearance` from every red cube center,
+    or `None` if no such path exists. Waypoints are downsampled every
+    `waypoint_stride` cells; goal_xy is always the final waypoint.
+    """
+    x0, x1 = bounds_x
+    y0, y1 = bounds_y
+    nx = int(np.ceil((x1 - x0) / grid_res)) + 1
+    ny = int(np.ceil((y1 - y0) / grid_res)) + 1
+
+    blocked = np.zeros((nx, ny), dtype=bool)
+    for cx, cy in reds:
+        i_lo = max(0, int(np.floor((cx - clearance - x0) / grid_res)))
+        i_hi = min(nx - 1, int(np.ceil((cx + clearance - x0) / grid_res)))
+        j_lo = max(0, int(np.floor((cy - clearance - y0) / grid_res)))
+        j_hi = min(ny - 1, int(np.ceil((cy + clearance - y0) / grid_res)))
+        for i in range(i_lo, i_hi + 1):
+            for j in range(j_lo, j_hi + 1):
+                if blocked[i, j]:
+                    continue
+                px = x0 + i * grid_res
+                py = y0 + j * grid_res
+                if (px - cx) ** 2 + (py - cy) ** 2 <= clearance ** 2:
+                    blocked[i, j] = True
+
+    def to_cell(p: np.ndarray) -> tuple[int, int]:
+        return (int(round((p[0] - x0) / grid_res)),
+                int(round((p[1] - y0) / grid_res)))
+
+    src = to_cell(blue_xy)
+    dst = to_cell(goal_xy)
+    if not (0 <= src[0] < nx and 0 <= src[1] < ny):
+        return None
+    if not (0 <= dst[0] < nx and 0 <= dst[1] < ny):
+        return None
+    if blocked[src] or blocked[dst]:
+        return None
+
+    visited = np.zeros_like(blocked)
+    parent: dict[tuple[int, int], tuple[int, int]] = {}
+    q: deque[tuple[int, int]] = deque([src])
+    visited[src] = True
+    while q:
+        cur = q.popleft()
+        if cur == dst:
+            break
+        for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1),
+                       (1, 1), (1, -1), (-1, 1), (-1, -1)):
+            ni, nj = cur[0] + di, cur[1] + dj
+            if not (0 <= ni < nx and 0 <= nj < ny):
+                continue
+            if visited[ni, nj] or blocked[ni, nj]:
+                continue
+            visited[ni, nj] = True
+            parent[(ni, nj)] = cur
+            q.append((ni, nj))
+    if not visited[dst]:
+        return None
+
+    # Reconstruct path by walking parents back to src.
+    cells: list[tuple[int, int]] = [dst]
+    cur = dst
+    while cur in parent:
+        cur = parent[cur]
+        cells.append(cur)
+    cells.reverse()
+
+    # Downsample, but always keep first and last.
+    sampled = cells[::waypoint_stride]
+    if sampled[-1] != cells[-1]:
+        sampled.append(cells[-1])
+
+    waypoints = [np.array([x0 + i * grid_res, y0 + j * grid_res]) for (i, j) in sampled]
+    # Snap final waypoint to the exact goal so the expert lands precisely.
+    waypoints[-1] = np.asarray(goal_xy, dtype=np.float64)
+    return waypoints
+
+
+def _sample_red_centers(
+    cfg: SceneConfig, rng: np.random.Generator,
+    blue_xy: np.ndarray, goal_xy: np.ndarray,
+) -> list[np.ndarray] | None:
+    """Place `cfg.n_red_cubes` inside the obstacle square with rejection on
+    separation. Red-cube ↔ red-cube uses `min_cube_separation`; red-cube ↔
+    blue/goal uses the larger `blue_safety_radius` / `goal_safety_radius`
+    so the start and drop-off zones stay clear. Returns None on failure
+    (caller retries with a fresh blue spawn)."""
+    cx, cy = cfg.red_field_center
+    half = cfg.red_field_size / 2
+    placed: list[np.ndarray] = []
+    sep = cfg.min_cube_separation
+    for _ in range(cfg.n_red_cubes):
+        for _ in range(400):
+            x = rng.uniform(cx - half, cx + half)
+            y = rng.uniform(cy - half, cy + half)
+            p = np.array([x, y])
+            ok = (
+                all(np.linalg.norm(p - q) >= sep for q in placed)
+                and np.linalg.norm(p - blue_xy) >= cfg.blue_safety_radius
+                and np.linalg.norm(p - goal_xy) >= cfg.goal_safety_radius
+            )
+            if ok:
+                placed.append(p)
+                break
+        else:
+            return None
+    return placed
+
+
+def sample_layout(cfg: SceneConfig, rng: np.random.Generator) -> Layout:
+    """Sample a workable scene: blue on +y, goal at the fixed -y point,
+    6 red cubes in the obstacle square, with a guaranteed connectivity path
+    from blue→goal."""
+    # Path-check region: a bit wider than the obstacle square in x, full
+    # blue→goal y-span vertically. The arm reaches roughly x ∈ [0.10, 0.40].
+    cx, cy = cfg.red_field_center
+    field_half = cfg.red_field_size / 2
+    bounds_x = (cx - field_half - 0.02, cx + field_half + 0.02)
+    blue_y_max = max(cfg.blue_y_range)
+    goal_y = cfg.goal_pos[1]
+    pad = 0.03
+    bounds_y = (min(goal_y, -blue_y_max) - pad, max(blue_y_max, abs(goal_y)) + pad)
+
+    goal_xy = np.array(cfg.goal_pos, dtype=np.float64)
+
+    for attempt in range(cfg.max_layout_attempts):
+        blue_xy = np.array([
+            rng.uniform(*cfg.blue_x_range),
+            rng.uniform(*cfg.blue_y_range),
+        ])
+        reds = _sample_red_centers(cfg, rng, blue_xy, goal_xy)
+        if reds is None:
+            continue
+        waypoints = _find_path(
+            reds, blue_xy, goal_xy,
+            clearance=cfg.path_clearance_radius,
+            grid_res=cfg.path_grid_res,
+            bounds_x=bounds_x, bounds_y=bounds_y,
+        )
+        if waypoints is None:
+            continue
+
+        red_specs = [
+            CubeSpec(
+                name=f"red_{i}",
+                pos=np.array([p[0], p[1], cfg.table_z + cfg.red_cube_half]),
+                half=cfg.red_cube_half,
+                rgba=(0.85, 0.15, 0.15, 1.0),
+            )
+            for i, p in enumerate(reds)
+        ]
+        blue = CubeSpec(
+            name="blue",
+            pos=np.array([blue_xy[0], blue_xy[1], cfg.table_z + cfg.blue_cube_half]),
+            half=cfg.blue_cube_half,
+            rgba=(0.15, 0.30, 0.90, 1.0),
+        )
+        return Layout(red_cubes=red_specs, blue_cube=blue,
+                      goal_xy=goal_xy, carry_waypoints=waypoints)
+
+    raise RuntimeError(
+        f"Failed to sample a workable layout in {cfg.max_layout_attempts} attempts. "
+        f"Try lowering n_red_cubes, shrinking min_cube_separation, or enlarging "
+        f"red_field_size."
+    )
+
+
+def _camera_xyaxes(pos: np.ndarray, lookat: np.ndarray) -> list[float]:
+    fwd = lookat - pos
+    fwd = fwd / (np.linalg.norm(fwd) + 1e-9)
+    world_up = np.array([0.0, 0.0, 1.0])
+    right = np.cross(world_up, -fwd)
+    right /= (np.linalg.norm(right) + 1e-9)
+    up = np.cross(-fwd, right)
+    return [*right, *up]
+
+
+def _attach_position_actuator(
+    spec: mujoco.MjSpec, *, name: str, joint_name: str,
+    ctrlrange: tuple[float, float], kp: float, kd: float,
+) -> None:
+    """Add a position-controlled actuator wired to `joint_name`."""
+    spec.add_actuator(
+        name=name,
+        target=joint_name,
+        trntype=mujoco.mjtTrn.mjTRN_JOINT,
+        gaintype=mujoco.mjtGain.mjGAIN_FIXED,
+        gainprm=[kp] + [0.0] * 9,
+        biastype=mujoco.mjtBias.mjBIAS_AFFINE,
+        biasprm=[0.0, -kp, -kd] + [0.0] * 7,
+        ctrllimited=1,
+        ctrlrange=list(ctrlrange),
+        forcelimited=1,
+        forcerange=[-_FORCE_LIMIT, _FORCE_LIMIT],
+    )
+
+
+def _add_world_decor(spec: mujoco.MjSpec, cfg: SceneConfig) -> None:
+    wb = spec.worldbody
+    # Floor plane (large, behind the table).
+    wb.add_geom(
+        name="floor",
+        type=mujoco.mjtGeom.mjGEOM_PLANE,
+        size=[2.0, 2.0, 0.05],
+        pos=[0.0, 0.0, -0.001],
+        rgba=[0.6, 0.6, 0.6, 1.0],
+    )
+    # Table-surface visual patch.
+    wb.add_geom(
+        name="table_plane",
+        type=mujoco.mjtGeom.mjGEOM_BOX,
+        size=[0.30, 0.30, 0.005],
+        pos=[0.275, 0.0, cfg.table_z - 0.005],
+        rgba=[0.85, 0.82, 0.78, 1.0],
+        contype=1, conaffinity=1,
+    )
+
+    # Visual border around the red-cube zone (4 thin black strips). Visual
+    # only (contype=conaffinity=0) so they don't perturb physics.
+    fx, fy = cfg.red_field_center
+    half = cfg.red_field_size / 2
+    thickness = 0.004                       # 8 mm strip thickness in plane (half-extent 4 mm)
+    # ~0.2 mm total height — flat like electrical tape stuck to the table.
+    # Lifted ~1 mm above the table top to avoid z-fighting with table_plane.
+    height_half = 0.0001
+    z_strip = cfg.table_z + 0.001 + height_half
+    edges = [
+        ("zone_edge_north", (fx, fy + half, z_strip), (half + thickness, thickness, height_half)),
+        ("zone_edge_south", (fx, fy - half, z_strip), (half + thickness, thickness, height_half)),
+        ("zone_edge_east",  (fx + half, fy, z_strip), (thickness, half + thickness, height_half)),
+        ("zone_edge_west",  (fx - half, fy, z_strip), (thickness, half + thickness, height_half)),
+    ]
+    for name, pos, size in edges:
+        wb.add_geom(
+            name=name,
+            type=mujoco.mjtGeom.mjGEOM_BOX,
+            size=list(size),
+            pos=list(pos),
+            rgba=[0.0, 0.0, 0.0, 1.0],
+            # MjSpec.compile() prunes geoms with contype=0/conaffinity=0 as
+            # "dead" — so we tag the border with a unique bit (4) that no
+            # other geom uses. Mask intersect with arm(2/1), cubes(1/1),
+            # floor/table(1/1) all evaluates to 0 ⇒ no actual collisions,
+            # but the renderer still draws them.
+            contype=4, conaffinity=4,
+        )
+
+    # Lights.
+    wb.add_light(pos=[0.3, 0.0, 1.2], dir=[0.0, 0.0, -1.0], diffuse=[0.8, 0.8, 0.8])
+    wb.add_light(pos=[0.7, 0.5, 1.0], dir=[-0.3, -0.3, -1.0], diffuse=[0.4, 0.4, 0.4])
+    # Camera (fixed pose).
+    xyaxes = _camera_xyaxes(np.array(cfg.camera_pos), np.array(cfg.camera_lookat))
+    wb.add_camera(
+        name=cfg.camera_name,
+        pos=list(cfg.camera_pos),
+        xyaxes=xyaxes,
+        fovy=cfg.camera_fovy,
+    )
+
+
+def _add_wrist_camera(spec: mujoco.MjSpec, cfg: SceneConfig) -> None:
+    """Mount a wrist camera on gripper_link looking at the grasp area.
+
+    The SO-101 URDF doesn't ship a camera, but a wrist-mounted USB cam is
+    the standard LeRobot setup. We attach it to `gripper_link` so the view
+    moves with the gripper, and use `targetbody` mode pointed at the
+    moving_jaw so MuJoCo keeps the camera oriented at the grasp point even
+    as the arm pose changes.
+    """
+    body = next((b for b in spec.bodies if b.name == "gripper_link"), None)
+    if body is None:
+        return
+    body.add_camera(
+        name=cfg.wrist_camera_name,
+        pos=list(cfg.wrist_camera_pos),
+        mode=mujoco.mjtCamLight.mjCAMLIGHT_TARGETBODY,
+        targetbody="moving_jaw_so101_v1_link",
+        fovy=cfg.wrist_camera_fovy,
+    )
+
+
+def _add_ee_site(spec: mujoco.MjSpec, cfg: SceneConfig) -> None:
+    """Add an end-effector tracking site. The SO-101 URDF already has a dummy
+    `gripper_frame_link` body at the gripper tip — we hang the site on it."""
+    target_name = "gripper_frame_link"
+    body = next((b for b in spec.bodies if b.name == target_name), None)
+    if body is None:
+        # Fallback: attach to the deepest body in the chain.
+        body = max((b for b in spec.bodies if b.name not in ("world",)),
+                   key=lambda b: len(b.name))
+    body.add_site(
+        name=cfg.ee_site_name,
+        pos=[0.0, 0.0, 0.0],
+        size=[0.005, 0.005, 0.005],
+        rgba=[1.0, 1.0, 0.0, 0.6],
+        group=3,
+    )
+
+
+def _add_goal_tape(wb, cfg: SceneConfig, layout: Layout) -> None:
+    """4 blue tape strips marking the goal square (3x3 inch interior)."""
+    gx, gy = float(layout.goal_xy[0]), float(layout.goal_xy[1])
+    half = cfg.goal_size / 2
+    thickness = 0.004                       # 8 mm wide strips
+    height_half = 0.0001                    # ~0.2 mm tall (electrical tape)
+    z_strip = cfg.table_z + 0.001 + height_half
+    blue_rgba = [0.1, 0.3, 0.95, 1.0]
+    edges = [
+        ("goal_tape_north", (gx, gy + half, z_strip), (half + thickness, thickness, height_half)),
+        ("goal_tape_south", (gx, gy - half, z_strip), (half + thickness, thickness, height_half)),
+        ("goal_tape_east",  (gx + half, gy, z_strip), (thickness, half + thickness, height_half)),
+        ("goal_tape_west",  (gx - half, gy, z_strip), (thickness, half + thickness, height_half)),
+    ]
+    for name, pos, size in edges:
+        wb.add_geom(
+            name=name,
+            type=mujoco.mjtGeom.mjGEOM_BOX,
+            size=list(size),
+            pos=list(pos),
+            rgba=blue_rgba,
+            contype=4, conaffinity=4,        # see note in _add_world_decor
+        )
+
+
+def _add_cubes_and_goal(spec: mujoco.MjSpec, cfg: SceneConfig, layout: Layout) -> None:
+    wb = spec.worldbody
+    for red in layout.red_cubes:
+        b = wb.add_body(name=red.name, pos=list(red.pos))
+        b.add_freejoint(name=f"{red.name}_free")
+        b.add_geom(
+            name=f"{red.name}_geom",
+            type=mujoco.mjtGeom.mjGEOM_BOX,
+            size=[red.half, red.half, red.half],
+            rgba=list(red.rgba),
+            mass=0.05,
+            friction=[1.0, 0.05, 0.001],
+            condim=4,
+        )
+
+    b = wb.add_body(name=layout.blue_cube.name, pos=list(layout.blue_cube.pos))
+    b.add_freejoint(name="blue_free")
+    b.add_geom(
+        name=f"{layout.blue_cube.name}_geom",
+        type=mujoco.mjtGeom.mjGEOM_BOX,
+        size=[layout.blue_cube.half] * 3,
+        rgba=list(layout.blue_cube.rgba),
+        mass=0.05,
+        friction=[1.0, 0.05, 0.001],
+        condim=4,
+    )
+
+    # Invisible site at the goal center (kept so the env can read its world
+    # position via site_xpos). The *visible* goal indicator is drawn as
+    # blue tape strips in _add_goal_tape.
+    wb.add_site(
+        name="goal",
+        type=mujoco.mjtGeom.mjGEOM_SPHERE,
+        pos=[layout.goal_xy[0], layout.goal_xy[1], cfg.table_z + 0.001],
+        size=[0.001, 0.001, 0.001],
+        rgba=[0.0, 0.0, 0.0, 0.0],         # invisible
+        group=3,
+    )
+    _add_goal_tape(wb, cfg, layout)
+
+
+def _add_actuators(spec: mujoco.MjSpec, cfg: SceneConfig) -> None:
+    """Add one position-controlled actuator per joint. ctrlrange = joint range."""
+    joints_by_name = {j.name: j for j in spec.joints}
+    for jname in (*cfg.arm_joint_names, cfg.gripper_joint_name):
+        if jname not in joints_by_name:
+            raise KeyError(
+                f"Joint '{jname}' not found in URDF. Available: {list(joints_by_name)}"
+            )
+        jr = joints_by_name[jname].range
+        # URDF-loaded joints carry their limits; fall back to a wide range if zero.
+        if jr[0] == 0.0 and jr[1] == 0.0:
+            jr = [-3.14, 3.14]
+        _attach_position_actuator(
+            spec,
+            name=f"{jname}_act",
+            joint_name=jname,
+            ctrlrange=(float(jr[0]), float(jr[1])),
+            kp=_KP, kd=_KD,
+        )
+
+
+def build_scene(cfg: SceneConfig, layout: Layout) -> tuple[mujoco.MjModel, mujoco.MjSpec]:
+    """Build and compile the full scene. Returns (model, spec)."""
+    src = cfg.resolved_mjcf()
+    if not src.exists():
+        raise FileNotFoundError(
+            f"Robot model not found at {src}. See sim/assets/README.md."
+        )
+    spec = mujoco.MjSpec.from_file(str(src))
+    spec.option.gravity = [0.0, 0.0, -9.81]
+    spec.option.timestep = 0.002
+
+    # URDFs don't ship joint damping/armature; without these, position
+    # controllers driving the SO-101 oscillate wildly. Apply uniformly to all
+    # of the arm + gripper joints (the cube freejoints we'll add later are
+    # different bodies — they get added after this and are unaffected).
+    arm_joints = set(cfg.arm_joint_names) | {cfg.gripper_joint_name}
+    for j in spec.joints:
+        if j.name in arm_joints:
+            # MjsJoint.damping is a length-3 vector (per-axis); only the first
+            # entry matters for a 1-dof hinge but all three must be set.
+            j.damping = [_JOINT_DAMPING, 0.0, 0.0]
+            j.armature = _JOINT_ARMATURE
+
+    _add_world_decor(spec, cfg)
+    _add_ee_site(spec, cfg)
+    _add_wrist_camera(spec, cfg)
+    _add_cubes_and_goal(spec, cfg, layout)
+    _add_actuators(spec, cfg)
+
+    model = spec.compile()
+
+    # Disable self-collision among arm bodies (incl. base-link geoms that the
+    # URDF parser flattened into world). Bit-mask trick:
+    #   arm geoms      → contype=2, conaffinity=1
+    #   world (floor / table / cubes) → contype=1, conaffinity=1 (default)
+    # Two geoms collide iff their masks intersect, so arm-vs-arm = 0 (off)
+    # but arm-vs-cube = 1 (on).
+    for g in range(model.ngeom):
+        bid = int(model.geom_bodyid[g])
+        bname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, bid) or ""
+        gname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g) or ""
+        is_arm_link = bname in _ARM_BODIES
+        is_flattened_base = (
+            bid == 0 and gname not in _NON_ARM_WORLD_GEOMS
+            and not gname.endswith("_geom")          # excludes our cube geoms
+        )
+        if is_arm_link or is_flattened_base:
+            model.geom_contype[g] = 2
+            model.geom_conaffinity[g] = 1
+
+    return model, spec
+
+
+# Back-compat alias: the env used to expect a path-based loader.
+def build_scene_xml(cfg: SceneConfig, layout: Layout) -> tuple[mujoco.MjModel, Path]:
+    model, _ = build_scene(cfg, layout)
+    # Path retained in signature for callers that wanted to keep a debug file.
+    return model, Path("<in-memory MjSpec>")

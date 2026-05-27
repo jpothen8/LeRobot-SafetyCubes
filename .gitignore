@@ -176,3 +176,18 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+### Constraint-aware VLA sim (sim/) ###
+# Rendered demos and collected datasets — regeneratable.
+videos/
+sim/outputs/
+
+# Personal hardware notes (USB serial paths, etc.).
+commands.txt
+
+# Re-include the SO-101 model assets that the *.stl / *.urdf / *.xml
+# patterns above would otherwise drop. The sim won't load the scene
+# without them.
+!sim/assets/**/*.stl
+!sim/assets/**/*.urdf
+!sim/assets/**/*.xml
