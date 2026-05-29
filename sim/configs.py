@@ -25,7 +25,7 @@ from pathlib import Path
 # Imperial → metric for the cube/field dimensions called out in the spec.
 _INCH = 0.0254
 _CUBE_SIDE = 1.0 * _INCH            # 1-inch cubes
-_FIELD_SIDE = 8.0 * _INCH           # 8-inch obstacle square
+_FIELD_SIDE = 12.0 * _INCH           # 8-inch obstacle square
 
 
 @dataclass
@@ -41,7 +41,7 @@ class SceneConfig:
     # ── Red obstacle field (12x12 inch square, ~0.30 m on a side) ────────
     # Centered in front of the arm, within easy reach of the SO-101 workspace.
     red_field_center: tuple[float, float] = (0.225, 0.0)
-    red_field_size: float = 12.0 * _INCH      # ≈ 0.3048 m
+    red_field_size: float = _FIELD_SIDE
     # Minimum center-to-center separation between any two red cubes.
     min_cube_separation: float = 0.055
     # Larger safety margin specifically around the blue cube and goal — they
@@ -120,7 +120,7 @@ class SceneConfig:
     # Default folds the arm forward so the gripper hangs over the obstacle
     # field instead of pointing straight up (the URDF zero pose blocks the
     # camera). Order matches arm_joint_names; gripper open.
-    home_qpos: tuple[float, ...] = (0.0, -1.2, 1.4, 0.3, 0.0)
+    home_qpos: tuple[float, ...] = (0.0, -1.2, 1.4, 0.3, -1.5707963267948966)  # wrist_roll +90°
     # Gripper starts CLOSED at reset. The expert opens it during APPROACH,
     # closes it during CLOSE. Matches a real teleop start-of-episode pose.
     home_gripper: float = -0.1

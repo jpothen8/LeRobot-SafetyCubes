@@ -22,6 +22,7 @@ that get written alongside it (e.g. `videos/demo_wrist.mp4`).
 from __future__ import annotations
 
 import argparse
+import subprocess
 from pathlib import Path
 
 import cv2
@@ -73,12 +74,28 @@ def _label(frame: np.ndarray, text: str) -> np.ndarray:
     return img
 
 
-def _open_writer(path: Path, fps: int, size: tuple[int, int]) -> cv2.VideoWriter:
-    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"),
-                              fps, size)
-    if not writer.isOpened():
-        raise RuntimeError(f"cv2.VideoWriter failed to open {path}")
-    return writer
+def _open_writer(path: Path, fps: int, size: tuple[int, int]) -> subprocess.Popen:
+    """Open an ffmpeg pipe that encodes raw BGR frames to H.264 MP4."""
+    W, H = size
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-pix_fmt", "bgr24", "-s", f"{W}x{H}", "-r", str(fps),
+        "-i", "-",
+        "-vcodec", "libx264", "-pix_fmt", "yuv420p",
+        "-crf", "23", "-preset", "fast",
+        str(path),
+    ]
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+
+def _write_frame(writer: subprocess.Popen, bgr_frame: np.ndarray) -> None:
+    writer.stdin.write(bgr_frame.tobytes())
+
+
+def _close_writer(writer: subprocess.Popen) -> None:
+    writer.stdin.close()
+    writer.wait()
 
 
 def record_episodes(args: argparse.Namespace) -> None:
@@ -96,7 +113,7 @@ def record_episodes(args: argparse.Namespace) -> None:
 
     agent_writer = _open_writer(agent_path, args.fps, (W, H))
     wrist_writer = _open_writer(wrist_path, args.fps, (W, H))
-    comp_writer = None
+    comp_writer: subprocess.Popen | None = None
     if not args.no_composite:
         comp_writer = _open_writer(composite_path, args.fps, (2 * W, H))
 
@@ -141,20 +158,20 @@ def record_episodes(args: argparse.Namespace) -> None:
             agent_annot = _label(_overlay(agent_frame, lines), "agentview")
             wrist_annot = _label(wrist_frame, "wrist_cam")
 
-            agent_writer.write(cv2.cvtColor(agent_annot, cv2.COLOR_RGB2BGR))
-            wrist_writer.write(cv2.cvtColor(wrist_annot, cv2.COLOR_RGB2BGR))
+            _write_frame(agent_writer, cv2.cvtColor(agent_annot, cv2.COLOR_RGB2BGR))
+            _write_frame(wrist_writer, cv2.cvtColor(wrist_annot, cv2.COLOR_RGB2BGR))
             if comp_writer is not None:
                 composite = np.concatenate([agent_annot, wrist_annot], axis=1)
-                comp_writer.write(cv2.cvtColor(composite, cv2.COLOR_RGB2BGR))
+                _write_frame(comp_writer, cv2.cvtColor(composite, cv2.COLOR_RGB2BGR))
 
             total_frames += 1
             if terminated or truncated:
                 hold = args.fps // 2
                 for _ in range(hold):
-                    agent_writer.write(cv2.cvtColor(agent_annot, cv2.COLOR_RGB2BGR))
-                    wrist_writer.write(cv2.cvtColor(wrist_annot, cv2.COLOR_RGB2BGR))
+                    _write_frame(agent_writer, cv2.cvtColor(agent_annot, cv2.COLOR_RGB2BGR))
+                    _write_frame(wrist_writer, cv2.cvtColor(wrist_annot, cv2.COLOR_RGB2BGR))
                     if comp_writer is not None:
-                        comp_writer.write(cv2.cvtColor(
+                        _write_frame(comp_writer, cv2.cvtColor(
                             np.concatenate([agent_annot, wrist_annot], axis=1),
                             cv2.COLOR_RGB2BGR))
                     total_frames += 1
@@ -164,10 +181,10 @@ def record_episodes(args: argparse.Namespace) -> None:
         wrist_viz.close()
         print(f"[ep {ep}] phase={expert._phase.name} stats={stats}")
 
-    agent_writer.release()
-    wrist_writer.release()
+    _close_writer(agent_writer)
+    _close_writer(wrist_writer)
     if comp_writer is not None:
-        comp_writer.release()
+        _close_writer(comp_writer)
     env.close()
     print(f"\nWrote {total_frames} frames")
     print(f"  agentview:  {agent_path}")

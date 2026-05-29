@@ -98,35 +98,110 @@ from the batch.
 }
 ```
 
-## DAgger loop sketch
+## End-to-end runbook (collect → BC warm-start → DAgger)
 
-The pieces above are the primitives — the DAgger loop is a small driver:
+The policy + training code now exists (`sim/safe_pi0_policy.py`, `sim/dagger.py`,
+`sim/scripts/`). It was written without a runnable environment, so **it is
+untested** — do step 0 before anything else.
+
+### 0. Setup + validate the geometry (cheap, do it first)
+
+```bash
+uv sync --locked --extra all          # base + policy deps
+uv pip install pytorch_kinematics      # differentiable FK for the safety loss
+
+# A sign error in the SDF/FK is cheap to catch now, expensive 40 epochs into a
+# 3B-param fine-tune. These tests are torch-only (no MuJoCo / VLA needed).
+uv run pytest sim/tests -q
+```
+
+Then spot-check the FK frame against ground truth on one recorded frame: load a
+sample, run `FKChain.fk(state[:5])`, and confirm it matches that frame's
+`privileged.ee_pos` (the loss assumes FK's base_link frame == the world frame —
+true while the URDF base sits at the origin).
+
+### 1. Collect data
+
+The safety term needs **both** success and failure data (failures are its
+negative class). Make a clean set for the BC warm start and a larger mixed set
+that contains failures:
+
+```bash
+# Clean successes — BC warm start
+uv run python -m sim.scripts.collect_demos \
+    --repo-id local/safe-cube-bc --root data/safe_cube_bc \
+    --n-episodes 100 --successes-only
+
+# Mixed set (keeps red-contact / drop / timeout failures)
+uv run python -m sim.scripts.collect_demos \
+    --repo-id local/safe-cube-mixed --root data/safe_cube_mixed \
+    --n-episodes 200
+```
+
+### 2. BC warm start (fine-tune π0 with the safety loss on)
+
+```bash
+uv run python -m sim.scripts.train_safe_pi0 \
+    --policy.type=safe_pi0 \
+    --policy.pretrained_path=lerobot/pi0_base \
+    --policy.safety_weight=1.0 \
+    --dataset.repo_id=local/safe-cube-mixed --dataset.root=data/safe_cube_mixed \
+    --output_dir=outputs/safe_pi0_bc \
+    --batch_size=8 --steps=20000 \
+    --policy.gradient_checkpointing=true
+```
+
+`--policy.safety_weight` (λ) is the central knob — sweep it. Too small → safety
+ignored; too large → the policy collapses to pure avoidance and stops doing the
+task. The evolving safety term makes the loss landscape non-stationary, so
+**early-stop at peak rollout success, not at min loss.** Checkpoint lands at
+`outputs/safe_pi0_bc/checkpoints/last/pretrained_model`.
+
+### 3. DAgger (collect on the policy's own state distribution → retrain)
+
+`sim/scripts/dagger.py` runs the full collect→retrain loop. Round 0 is pure
+expert; later rounds load the previous checkpoint, mix in policy actions
+(`alpha = alpha0 ** round`), and **always label with the expert** — which is what
+drags training onto deployment-distribution states and produces fresh failures.
+
+```bash
+uv run python -m sim.scripts.dagger \
+    --repo-id local/safe-cube-dagger --root data/safe_cube_dagger \
+    --output-root outputs/safe_pi0_dagger \
+    --rounds 3 --episodes-per-round 40 \
+    --base-policy outputs/safe_pi0_bc/checkpoints/last/pretrained_model \
+    --safety-weight 1.0 --steps 8000 --batch-size 8
+```
+
+Use `--no-train` to only collect, or `--print-only` to see the constructed
+training commands without running them.
+
+### 4. Evaluate
+
+`sim.evaluate.evaluate()` reports success / red-contact / clearance / ceiling
+rates. Wrap a checkpoint with `sim.dagger.PolicyRollout` and pass its `.act` as
+the `policy` argument:
 
 ```python
-from sim import SafeCubeEnv, EnvConfig, ExpertConfig
-from sim.expert import ScriptedExpert
-from sim.recorder import EpisodeRecorder
+from sim import SafeCubeEnv, EnvConfig
+from sim.dagger import PolicyRollout
+from sim.evaluate import evaluate
 
-env = SafeCubeEnv(EnvConfig(...))
-expert = ScriptedExpert(env=env, cfg=ExpertConfig())
-
-for j in range(N_DAGGER_ROUNDS):
-    alpha = ALPHA0 ** j           # mixing weight: expert-heavy -> policy-heavy
-    for ep in range(EPISODES_PER_ROUND):
-        obs, info = env.reset(seed=...)
-        rec.begin_episode(task=...)
-        expert.reset()
-        while not done:
-            expert_action = expert.act(info)
-            policy_action = policy.act(obs)       # your π0 inference
-            use_expert = rng.random() < alpha
-            action = expert_action if use_expert else policy_action
-            # Always label with the expert action (DAgger).
-            rec.add(obs, expert_action, info)
-            obs, _, terminated, truncated, info = env.step(action)
-        rec.save_episode()
-    train_one_pass(policy, dataset, L_task + lam * L_safety)
+env = SafeCubeEnv(EnvConfig())
+roll = PolicyRollout(
+    checkpoint="outputs/safe_pi0_dagger/round_2/checkpoints/last/pretrained_model",
+    dataset_repo_id="local/safe-cube-dagger", dataset_root="data/safe_cube_dagger",
+)
+task = "pick up the blue cube ... place it on the goal patch"
+res = evaluate(env=env, policy=lambda obs: roll.act(obs, task), n_episodes=50)
+print(res.summary())
 ```
+
+### 5. Deploy
+
+Identical to a vanilla π0: `image → π0 → action`. No SDF, no cube positions, no
+filter — the safety preference lives in the weights. (On real hardware, keep the
+thin clearance watchdog from `project_summary.md` §7.4 as insurance.)
 
 ## Knobs worth tuning first
 

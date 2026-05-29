@@ -181,10 +181,46 @@ uv run python -m sim.scripts.collect_demos --repo-id local/safe-cube-bc \
 .venv/bin/mjpython -m sim.scripts.view_env
 ```
 
-## What's NOT done yet (for the next agent)
+## Training pipeline (`SafePI0Policy` + DAgger) — built, NOT yet run
 
-- **`SafePI0Policy`** — the LeRobot subclass with `L = L_flow_matching + λ·L_safety` per `project_summary.md` §5. Privileged keys are already in the recorded datasets (`privileged.cube_positions`, `privileged.cube_half_extents`, `privileged.blue_cube_pos`, `privileged.goal_pos`, `privileged.ee_pos`, `privileged.grasped`) — the policy/loss just needs to read them from the batch and ignore them at inference. Per-cube arrays are flattened to 1D; reshape on load.
-- **DAgger driver** — sketched in `sim/README.md`. The primitives it needs are already in place (`SafeCubeEnv`, `ScriptedExpert`, `EpisodeRecorder`, `evaluate.evaluate()`).
+The policy/training half of `project_summary.md` now exists but is **untested**
+(no runnable Python env was available when it was written — validate before
+trusting it):
+
+- **`sim/safety_geometry.py`** — pure-torch, LeRobot-free primitives: `box_sdf`,
+  `sdf_clearance`, `safety_loss`, and `FKChain` (differentiable FK via
+  `pytorch_kinematics`, end link `gripper_frame_link`). Unit-tested in
+  `sim/tests/test_safety_geometry.py` (`uv run pytest sim/tests -q`). **Run these
+  first** — a sign error here is cheap to catch now, expensive 40 epochs into a 3B run.
+- **`sim/safe_pi0_policy.py`** — `SafePI0Config` (registered as `safe_pi0`) +
+  `SafePI0Policy(PI0Policy)`. Overrides `forward` so one velocity prediction feeds
+  both `L_flow` and the endpoint-estimate safety term. **Flow convention:** LeRobot's
+  π0 is `x_t = t·noise + (1−t)·actions` (t=0→data, t=1→noise) — the *opposite* of
+  `project_summary.md` §5.1. So the endpoint estimate is `â = x_t − t·v` and the
+  safety loss is weighted by `(1−t)`. Actions are MEAN_STD-normalized before
+  `forward`, so `â` is un-normalized (via `dataset_stats[ACTION]`, captured in
+  `__init__`) before FK.
+- **`sim/dagger.py` / `sim/scripts/dagger.py`** — `PolicyRollout` (checkpoint →
+  closed-loop `act(obs)` via the stock preprocessor→`select_action`→postprocessor
+  path) + the collect-round logic, and a CLI orchestrator that runs
+  collect→retrain rounds (retrain shells out to the stock entrypoint).
+- **`sim/scripts/train_safe_pi0.py`** — thin shim: imports the policy module (to
+  register `safe_pi0` with draccus) then calls the stock `train()`.
+- **Privileged-key plumbing (one stock edit):** `src/lerobot/processor/converters.py`
+  `_extract_complementary_data` now preserves any `privileged.*` batch key. Without
+  this the preprocessor (`batch = preprocessor(batch)` in the train loop) drops them
+  before `forward` and the safety loss can't see the cube positions. They ride
+  through as complementary data → un-normalized, untouched by feature classification
+  (`dataset_to_policy_features` `continue`s on non-`observation`/`action` keys).
+
+**Before the first real run, verify:** (1) `pytorch_kinematics` is installed and
+`FKChain.fk(state[:5])` matches the recorded `privileged.ee_pos` on a sample frame
+(FK-frame == world-frame assumption); (2) privileged keys actually arrive in
+`policy.forward`'s batch; (3) sweep `λ` (`--policy.safety_weight`) — it's the
+central knob.
+
+## Still NOT done
+
 - **Domain randomization not yet applied.** `sim/randomize.py` defines `apply_dr(model, rng, cfg)` but `env.reset()` doesn't call it. Wire it in after the scene compiles, before the first physics step, when ready.
 - **Real-world fine-tune / hardware deployment** — out of scope for the sim.
 

@@ -170,13 +170,15 @@ _COMPLEMENTARY_KEYS = (
 def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
     """Extract complementary data from a batch dictionary.
 
-    Includes padding flags (any key containing ``_is_pad``) plus the fixed
-    set of metadata / language keys defined in ``_COMPLEMENTARY_KEYS`` —
-    each only when present in ``batch``.
+    Includes padding flags (any key containing ``_is_pad``), any ``privileged.*``
+    key (loss-only fields that must reach ``policy.forward`` un-normalized — see
+    ``sim/safe_pi0_policy.py``), plus the fixed set of metadata / language keys
+    defined in ``_COMPLEMENTARY_KEYS`` — each only when present in ``batch``.
     """
     pad_keys = {k: v for k, v in batch.items() if "_is_pad" in k}
+    privileged_keys = {k: v for k, v in batch.items() if k.startswith("privileged.")}
     extras = {k: batch[k] for k in _COMPLEMENTARY_KEYS if k in batch}
-    return {**pad_keys, **extras}
+    return {**pad_keys, **privileged_keys, **extras}
 
 
 def create_transition(
