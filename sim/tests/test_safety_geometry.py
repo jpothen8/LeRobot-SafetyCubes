@@ -14,7 +14,13 @@ import math
 import pytest
 import torch
 
-from sim.safety_geometry import FKChain, box_sdf, safety_loss, sdf_clearance
+from sim.safety_geometry import (
+    FKChain,
+    box_sdf,
+    height_ceiling_loss,
+    safety_loss,
+    sdf_clearance,
+)
 
 _HAS_PK = importlib.util.find_spec("pytorch_kinematics") is not None
 
@@ -84,6 +90,68 @@ def test_safety_loss_gradient_flows_to_points():
     # so the gradient wrt x must be negative (descent moves the ee away).
     assert points.grad is not None
     assert points.grad[0, 0, 0] < 0
+
+
+# ----- lateral (XY-only) obstacle clearance ---------------------------------
+def test_box_sdf_lateral_ignores_height():
+    # Cube at origin, half 1. A point straight above (same XY) is OUTSIDE in 3D
+    # (going over the top) but INSIDE the infinite vertical prism laterally.
+    centers = torch.zeros(1, 1, 3)
+    halves = torch.ones(1, 1, 3)
+    above = torch.tensor([[[0.0, 0.0, 5.0]]])
+    sdf_3d = box_sdf(above, centers, halves)[0, 0, 0]
+    sdf_xy = box_sdf(above, centers, halves, lateral=True)[0, 0, 0]
+    assert sdf_3d.item() == pytest.approx(4.0, abs=1e-6)      # 5 - 1 above the top
+    assert sdf_xy.item() == pytest.approx(-1.0, abs=1e-6)     # inside the XY footprint
+    assert sdf_xy < sdf_3d
+
+    # Beside the cube: lateral distance equals the XY excess, height ignored.
+    beside = torch.tensor([[[3.0, 0.0, 5.0]]])               # XY excess (2, -1) -> 2.0
+    assert box_sdf(beside, centers, halves, lateral=True)[0, 0, 0].item() == pytest.approx(
+        2.0, abs=1e-6
+    )
+
+
+def test_sdf_clearance_lateral_penalises_flying_over():
+    # Directly over a cube: 3D clearance is safely positive, lateral is negative
+    # (so "fly over the top" no longer escapes the obstacle penalty).
+    centers = torch.zeros(1, 1, 3)
+    halves = torch.full((1, 1, 3), 0.5)
+    over = torch.tensor([[[0.0, 0.0, 2.0]]])
+    cl_3d = sdf_clearance(over, centers, halves, ee_radius=0.05)[0, 0]
+    cl_xy = sdf_clearance(over, centers, halves, ee_radius=0.05, lateral=True)[0, 0]
+    assert cl_3d > 0
+    assert cl_xy < 0
+
+
+# ----- height-ceiling (stay-low) penalty ------------------------------------
+def test_height_ceiling_loss_spikes_above_ceiling():
+    ceiling, alpha = 0.06, 250.0              # default config sharpness
+    carry = torch.tensor([[0.04, 0.04]])      # expert carry height -> ~0 penalty
+    at = torch.tensor([[0.06, 0.06]])         # right at the ceiling
+    over = torch.tensor([[0.10, 0.12]])       # flying over the top -> should spike
+    l_carry = height_ceiling_loss(carry, ceiling, alpha=alpha)
+    l_at = height_ceiling_loss(at, ceiling, alpha=alpha)
+    l_over = height_ceiling_loss(over, ceiling, alpha=alpha)
+    assert l_carry < 1e-2                      # ~0 at the expert carry height (40 mm)
+    assert l_over > l_at > l_carry             # monotonic, spikes above
+    assert l_over.item() > 1.0                 # a real spike, not a nudge
+
+
+def test_height_ceiling_loss_gradient_pushes_down():
+    ceiling = 0.06
+    ee_z = torch.tensor([[0.10]], requires_grad=True)   # above the ceiling
+    height_ceiling_loss(ee_z, ceiling, alpha=100.0).backward()
+    # Loss grows with height, so descent (negative grad step) lowers z.
+    assert ee_z.grad is not None and ee_z.grad[0, 0] > 0
+
+
+def test_height_ceiling_loss_grasp_gate_zeroes_out():
+    # weight=0 (not grasped / not carrying) -> no penalty even if sky-high.
+    ee_z = torch.tensor([[1.0], [1.0]])       # both far above ceiling
+    w_off = torch.tensor([0.0, 0.0])
+    l = height_ceiling_loss(ee_z, 0.06, alpha=100.0, weight=w_off)
+    assert torch.isfinite(l) and l.item() == pytest.approx(0.0, abs=1e-6)
 
 
 # ----- FK tests (skip if the dependency / URDF is unavailable) --------------
