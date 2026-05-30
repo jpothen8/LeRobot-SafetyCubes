@@ -98,12 +98,24 @@ class SceneConfig:
     # at the moving_jaw so it always shows the grasp area regardless of
     # arm pose.
     wrist_camera_name: str = "wrist_cam"
-    # gripper_link local frame at home pose:
-    #   +x ≈ up-forward in world, +z ≈ back-up in world
-    # So (+0.05, 0, +0.06) puts the camera up-forward and slightly back —
-    # behind the moving jaw, looking past the gripper at the grasp area.
-    wrist_camera_pos: tuple[float, float, float] = (0.05, 0.0, 0.06)
+    # Position is in gripper_link's local frame. Useful axes (home pose):
+    #   local +z  = wrist-roll axis (the "wrist barrel" the cam mounts around)
+    #   local +x  → world -Y  (operator's right, from the agentview)
+    #   local +y  → world +Z  (up / "on top of the wrist")
+    # The gripper extends toward -z, so +z is the along-barrel back-offset
+    # (smaller = closer to the gripper) and +y is the height above the wrist.
+    # Mounted ON TOP of the wrist (radial offset along +y), a little above and
+    # pulled in close over the gripper. (Rotated 90° about the wrist-roll axis
+    # from the old right-side (0.05, 0, 0.06) mount — this moves the camera,
+    # not the wrist joint.)
+    wrist_camera_pos: tuple[float, float, float] = (0.0, 0.08, 0.03)
     wrist_camera_fovy: float = 70.0
+    # Extra upward tilt of the wrist cam, in degrees, applied on top of the
+    # auto-framed orientation (see scene._freeze_wrist_camera_orientation):
+    # pitches the optical axis up about the camera's right axis, so it looks
+    # further up the gripper's reach. Keeps the view horizontally centered and
+    # the gripper vertical; just slides the gripper lower in frame.
+    wrist_camera_pitch_up_deg: float = 12.0
 
     # ── Joint names (must match the URDF) ────────────────────────────────
     arm_joint_names: tuple[str, ...] = (

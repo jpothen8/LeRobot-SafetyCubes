@@ -341,13 +341,16 @@ def _add_world_decor(spec: mujoco.MjSpec, cfg: SceneConfig) -> None:
 
 
 def _add_wrist_camera(spec: mujoco.MjSpec, cfg: SceneConfig) -> None:
-    """Mount a wrist camera on gripper_link looking at the grasp area.
+    """Mount a wrist camera *rigidly* on gripper_link, like a real bolted-on
+    USB cam (the standard LeRobot setup).
 
-    The SO-101 URDF doesn't ship a camera, but a wrist-mounted USB cam is
-    the standard LeRobot setup. We attach it to `gripper_link` so the view
-    moves with the gripper, and use `targetbody` mode pointed at the
-    moving_jaw so MuJoCo keeps the camera oriented at the grasp point even
-    as the arm pose changes.
+    The camera is parented to `gripper_link`, so it rides with the wrist. We
+    use `fixed` mode (NOT `targetbody`): targetbody auto-aims at a target and
+    gimbal-locks the roll to world-up, so the image would *not* roll with
+    `wrist_roll` — unphysical for a bolted-on camera. With `fixed` mode the
+    whole camera frame is rigid in the gripper, so it rotates with the wrist.
+    The orientation is frozen post-compile by `_freeze_wrist_camera_orientation`
+    (it needs forward kinematics, unavailable at spec-build time).
     """
     body = next((b for b in spec.bodies if b.name == "gripper_link"), None)
     if body is None:
@@ -355,10 +358,85 @@ def _add_wrist_camera(spec: mujoco.MjSpec, cfg: SceneConfig) -> None:
     body.add_camera(
         name=cfg.wrist_camera_name,
         pos=list(cfg.wrist_camera_pos),
-        mode=mujoco.mjtCamLight.mjCAMLIGHT_TARGETBODY,
-        targetbody="moving_jaw_so101_v1_link",
+        mode=mujoco.mjtCamLight.mjCAMLIGHT_FIXED,
         fovy=cfg.wrist_camera_fovy,
     )
+
+
+def _freeze_wrist_camera_orientation(model: mujoco.MjModel, cfg: SceneConfig) -> None:
+    """Freeze the wrist camera's orientation in the gripper frame.
+
+    Frames the gripper so it sits centered and pointing straight up:
+      * optical axis aimed at the gripper's geometric centroid  → centered;
+      * roll set so the gripper's reach direction (gripper_link → the grasp
+        `ee_site`, i.e. the way the fingers point) projects to image-up  →
+        the gripper stands vertical, fingers up.
+    Everything is computed in the gripper frame, so the orientation stays
+    correct if `wrist_camera_pos` changes. Baked into `cam_quat` with
+    `mode=fixed`, so the frame is rigid in `gripper_link` and rolls with
+    `wrist_roll` like a real bolted-on camera. Must run post-compile (uses FK).
+    """
+    cid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, cfg.wrist_camera_name)
+    gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "gripper_link")
+    sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, cfg.ee_site_name)
+    if cid < 0 or gid < 0 or sid < 0:
+        return
+
+    # FK at the home pose on a throwaway buffer (geometry within the gripper is
+    # arm-pose-independent, but the gripper jaw opening is set by home_gripper).
+    data = mujoco.MjData(model)
+    for nm, val in zip(cfg.arm_joint_names, cfg.home_qpos):
+        j = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, nm)
+        if j >= 0:
+            data.qpos[model.jnt_qposadr[j]] = val
+    gj = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, cfg.gripper_joint_name)
+    if gj >= 0:
+        data.qpos[model.jnt_qposadr[gj]] = cfg.home_gripper
+    mujoco.mj_forward(model, data)
+
+    gmat = data.xmat[gid].reshape(3, 3)
+    gpos = data.xpos[gid]
+
+    def to_local(p):
+        return gmat.T @ (p - gpos)
+
+    def in_gripper_subtree(b):
+        while b > 0:
+            if b == gid:
+                return True
+            b = int(model.body_parentid[b])
+        return False
+
+    centers = [to_local(data.geom_xpos[g]) for g in range(model.ngeom)
+               if in_gripper_subtree(int(model.geom_bodyid[g]))]
+    centroid = np.mean(centers, axis=0) if centers else np.zeros(3)
+    reach = to_local(data.site_xpos[sid])           # gripper_link → grasp point
+
+    cam = np.array(cfg.wrist_camera_pos)
+    fwd = centroid - cam
+    fwd /= np.linalg.norm(fwd) + 1e-9               # aim at centroid → centered
+    up = reach / (np.linalg.norm(reach) + 1e-9)     # reach dir → image up
+    # Camera frame (in gripper frame): x=right, y=up, z=back(-fwd).
+    z = -fwd
+    y = up - (up @ z) * z
+    y /= np.linalg.norm(y) + 1e-9
+    x = np.cross(y, z)
+    x /= np.linalg.norm(x) + 1e-9
+    R = np.column_stack([x, y, z])
+
+    # Extra upward tilt: rotate the camera about its own right axis so the
+    # optical axis pitches up toward the gripper's reach (keeps it horizontally
+    # centered and vertical).
+    a = np.radians(cfg.wrist_camera_pitch_up_deg)
+    c, s = np.cos(a), np.sin(a)
+    R = R @ np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+
+    quat = np.zeros(4)
+    mujoco.mju_mat2Quat(quat, R.flatten())
+
+    model.cam_mode[cid] = int(mujoco.mjtCamLight.mjCAMLIGHT_FIXED)
+    model.cam_targetbodyid[cid] = -1
+    model.cam_quat[cid] = quat
 
 
 def _add_ee_site(spec: mujoco.MjSpec, cfg: SceneConfig) -> None:
@@ -515,6 +593,8 @@ def build_scene(cfg: SceneConfig, layout: Layout) -> tuple[mujoco.MjModel, mujoc
         if is_arm_link or is_flattened_base:
             model.geom_contype[g] = 2
             model.geom_conaffinity[g] = 1
+
+    _freeze_wrist_camera_orientation(model, cfg)
 
     return model, spec
 
