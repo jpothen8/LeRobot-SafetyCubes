@@ -441,7 +441,14 @@ def _freeze_wrist_camera_orientation(model: mujoco.MjModel, cfg: SceneConfig) ->
 
 def _add_ee_site(spec: mujoco.MjSpec, cfg: SceneConfig) -> None:
     """Add an end-effector tracking site. The SO-101 URDF already has a dummy
-    `gripper_frame_link` body at the gripper tip — we hang the site on it."""
+    `gripper_frame_link` body at the gripper tip — we hang the site on it.
+
+    Also add a `grasp_site` at the jaw-gap center (midway between the open
+    finger faces, at the fingertip plane). The URDF gripper frame sits at the
+    FIXED jaw, ~3 cm to the side of where a grasped cube actually goes, so
+    targeting it perches the cube on one jaw instead of between them. The
+    grasp site is the true tool-center point: IK and the magnetic grip target
+    it so the cube ends up centered between the fingers."""
     target_name = "gripper_frame_link"
     body = next((b for b in spec.bodies if b.name == target_name), None)
     if body is None:
@@ -453,6 +460,13 @@ def _add_ee_site(spec: mujoco.MjSpec, cfg: SceneConfig) -> None:
         pos=[0.0, 0.0, 0.0],
         size=[0.005, 0.005, 0.005],
         rgba=[1.0, 1.0, 0.0, 0.6],
+        group=3,
+    )
+    body.add_site(
+        name=cfg.grasp_site_name,
+        pos=list(cfg.grasp_site_offset),
+        size=[0.005, 0.005, 0.005],
+        rgba=[0.0, 1.0, 1.0, 0.6],
         group=3,
     )
 

@@ -60,6 +60,11 @@ class EpisodeRecorder:
                 "shape": (H, W, 3),
                 "names": ["height", "width", "channels"],
             },
+            "observation.images.wrist": {
+                "dtype": "video" if use_videos else "image",
+                "shape": (H, W, 3),
+                "names": ["height", "width", "channels"],
+            },
             "observation.state": {
                 "dtype": "float32",
                 "shape": (state_dim,),
@@ -115,6 +120,7 @@ class EpisodeRecorder:
             raise RuntimeError("begin_episode(task=...) must be called before add().")
         frame = {
             "observation.images.agentview": _to_uint8(obs["image"]),
+            "observation.images.wrist": _to_uint8(obs["wrist_image"]),
             "observation.state": np.asarray(obs["state"], dtype=np.float32),
             "action": np.asarray(action, dtype=np.float32),
             "privileged.cube_positions": np.asarray(info["cube_positions"], dtype=np.float32).reshape(-1),

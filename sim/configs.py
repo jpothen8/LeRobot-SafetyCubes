@@ -127,6 +127,14 @@ class SceneConfig:
     )
     gripper_joint_name: str = "gripper"
     ee_site_name: str = "ee_site"
+    # Tool-center-point site at the jaw-gap center (midway between the open
+    # finger faces, at the fingertip plane). The URDF's gripper frame sits at
+    # the FIXED jaw, so it is offset ~3 cm laterally from where a grasped cube
+    # actually goes; the grasp site corrects that so IK + the magnetic grip
+    # center the cube between the fingers. Offset is in the gripper-frame body
+    # frame, measured from the ee_site (see PR grasp-geometry probe).
+    grasp_site_name: str = "grasp_site"
+    grasp_site_offset: tuple[float, float, float] = (0.03083, -0.00067, 0.0012)
 
     # ── Home pose (per joint, radians) ───────────────────────────────────
     # Default folds the arm forward so the gripper hangs over the obstacle
@@ -170,12 +178,14 @@ class ExpertConfig:
     # Pre-grasp lift above the cube (relative to cube z, used by APPROACH).
     pre_grasp_height: float = 0.07
 
-    # DESCEND target offset above the cube center. Combined with the natural
-    # contact stop (the gripper bottoms out on the cube + table ~8 mm above
-    # target), this lands the gripper at the cube edge with a small
-    # tolerance instead of pressing into the cube.
-    descend_clearance: float = 0.004    # 4 mm above the cube center
-    descend_reach_tol: float = 0.018    # tolerant of contact-stopped descent
+    # DESCEND drives the jaw-gap center (grasp site) to this ABSOLUTE world z,
+    # lowering the open jaws down the SIDES of the cube. Calibrated so the
+    # fingertips land at ~0.25x the cube height (≈6.3 mm above the table for a
+    # 1-inch cube) — a realistic side grasp rather than perching on the cube
+    # top. The grasp site sits ~7 mm above the fingertips at the grasp pose,
+    # so 0.0134 → tips ≈ 0.0064 m.
+    descend_grasp_z: float = 0.0134
+    descend_reach_tol: float = 0.012    # settle close to the target depth
 
     # CLOSE phase advances only once the gripper qpos drops below this
     # (jaws actually closed). Min in URDF is -0.174.
@@ -187,18 +197,18 @@ class ExpertConfig:
     # (jaws actually open enough to release the cube).
     grasp_open_qpos_threshold: float = 0.45
 
-    # ABSOLUTE world-frame z for the lift/carry/release phases. These must
-    # stay below SceneConfig.ee_height_ceiling. Set so the *held cube* is at
+    # ABSOLUTE world-frame z for the held cube (jaw-gap center) during the
+    # lift/carry/release phases. The cube is locked to the grasp site, so these
+    # are the cube-center heights directly. Set so the carried cube rides at
     # the same height as the red obstacles (cube center ≈ red-top height),
-    # which is what "weave between" actually means — anything higher means
-    # the trajectory clears the obstacle field by going over it.
-    # ee_site is offset +12 mm from the held cube center, so:
-    #   ee_z = 0.040  →  held cube center ≈ 0.028  (just above 25 mm reds)
-    carry_z: float = 0.040
-    pre_release_z: float = 0.028
+    # which is what "weave between" actually means — anything higher means the
+    # trajectory clears the obstacle field by going over it. The ee_site (fixed
+    # jaw) rides above the cube and stays under SceneConfig.ee_height_ceiling.
+    carry_z: float = 0.028
+    pre_release_z: float = 0.016
 
     # Waypoint following during CARRY: advance to the next BFS waypoint when
-    # the ee is within this XY tolerance of it.
+    # the TCP (held cube) is within this XY tolerance of it.
     waypoint_reach_tol: float = 0.025
 
     # Damped least-squares IK.

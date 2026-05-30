@@ -53,7 +53,8 @@ class PolicyRollout:
             feature shapes and normalization stats. Use the same dataset the
             policy was trained on.
         device: torch device string; defaults to the policy config's device.
-        image_key: dataset image feature key.
+        image_key: main (agentview) dataset image feature key.
+        wrist_image_key: wrist-cam dataset image feature key.
     """
 
     def __init__(
@@ -64,6 +65,7 @@ class PolicyRollout:
         dataset_root: str | None = None,
         device: str | None = None,
         image_key: str = "observation.images.agentview",
+        wrist_image_key: str = "observation.images.wrist",
     ) -> None:
         from lerobot.configs import PreTrainedConfig
         from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
@@ -82,19 +84,27 @@ class PolicyRollout:
         self.policy.eval()
         self.device = cfg.device
         self.image_key = image_key
+        self.wrist_image_key = wrist_image_key
 
     def reset(self) -> None:
         self.policy.reset()
 
     def _format(self, obs: dict, task: str) -> dict:
-        img = torch.from_numpy(np.ascontiguousarray(obs["image"]))  # (H, W, 3) uint8
-        img = img.permute(2, 0, 1).unsqueeze(0).float() / 255.0     # (1, 3, H, W) in [0, 1]
+        def to_chw(arr) -> torch.Tensor:
+            t = torch.from_numpy(np.ascontiguousarray(arr))         # (H, W, 3) uint8
+            return t.permute(2, 0, 1).unsqueeze(0).float() / 255.0  # (1, 3, H, W) in [0, 1]
+
         state = torch.from_numpy(np.asarray(obs["state"], dtype=np.float32)).unsqueeze(0)
-        return {
-            self.image_key: img.to(self.device),
+        batch = {
+            self.image_key: to_chw(obs["image"]).to(self.device),
             "observation.state": state.to(self.device),
             "task": [task],
         }
+        # Wrist cam is a second policy camera; harmless if the loaded policy was
+        # trained single-cam (_preprocess_images only reads its config's keys).
+        if "wrist_image" in obs:
+            batch[self.wrist_image_key] = to_chw(obs["wrist_image"]).to(self.device)
+        return batch
 
     def act(self, obs: dict, task: str) -> np.ndarray:
         """Return a single raw-joint action ``(action_dim,)`` for ``obs``.

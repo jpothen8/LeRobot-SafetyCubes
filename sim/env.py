@@ -1,8 +1,9 @@
 """SafeCubeEnv — MuJoCo environment for constraint-aware VLA training.
 
 Observation (the policy sees this):
-    image      uint8 (H, W, 3)
-    state      float32 (n_arm_joints + 1,)   joint positions + gripper
+    image        uint8 (H, W, 3)   agentview (main) camera
+    wrist_image  uint8 (H, W, 3)   wrist-mounted camera
+    state        float32 (n_arm_joints + 1,)   joint positions + gripper
 
 Privileged info (rides in info dict; only the *loss* may read it):
     cube_positions       float32 (n_red, 3)
@@ -96,9 +97,12 @@ class SafeCubeEnv:
         self._grip_qpos_attach_threshold: float = 0.20
         self._grip_qpos_release_threshold: float = 0.40
         self._grip_attach_radius: float = 0.04
-        # Vertical offset between ee_site and the cube center while held.
-        self._grip_cube_offset_z: float = -0.012
+        # Vertical offset between the grasp site (jaw-gap center) and the cube
+        # center while held. The grasp site sits at the fingertip plane and the
+        # cube center is essentially coincident with it, so this is ~0.
+        self._grip_cube_offset_z: float = 0.0
         self._ee_site_id: int = -1
+        self._grasp_site_id: int = -1
         self._goal_site_id: int = -1
 
     # ----- public API -----------------------------------------------------
@@ -182,8 +186,16 @@ class SafeCubeEnv:
         return obs, reward, terminated, truncated, info
 
     def render(self) -> np.ndarray:
+        """Render the agentview (main) camera — the policy's primary image."""
+        return self._render_camera(self.cfg.scene.camera_name)
+
+    def render_wrist(self) -> np.ndarray:
+        """Render the wrist camera — the policy's secondary image."""
+        return self._render_camera(self.cfg.scene.wrist_camera_name)
+
+    def _render_camera(self, camera: str) -> np.ndarray:
         assert self.renderer is not None and self.data is not None
-        self.renderer.update_scene(self.data, camera=self.cfg.scene.camera_name)
+        self.renderer.update_scene(self.data, camera=camera)
         return self.renderer.render()
 
     def close(self) -> None:
@@ -270,6 +282,7 @@ class SafeCubeEnv:
                     self._gripper_geom_ids.add(g)
 
         self._ee_site_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, sc.ee_site_name)
+        self._grasp_site_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, sc.grasp_site_name)
         self._goal_site_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "goal")
 
     def _apply_action(self, a: np.ndarray) -> None:
@@ -287,7 +300,8 @@ class SafeCubeEnv:
         qpos = np.array([self.data.qpos[i] for i in self._arm_qpos_idx], dtype=np.float32)
         grip = np.float32(self.data.qpos[self._gripper_qpos_idx]) if self._gripper_qpos_idx >= 0 else np.float32(0.0)
         state = np.concatenate([qpos, np.array([grip], dtype=np.float32)])
-        return {"image": self.render(), "state": state}
+        return {"image": self.render(), "wrist_image": self.render_wrist(),
+                "state": state}
 
     def _privileged(self) -> dict[str, Any]:
         assert self.data is not None and self.layout is not None
@@ -313,35 +327,38 @@ class SafeCubeEnv:
     def _update_grasp(self) -> None:
         """Magnetic-grip controller. Attaches the blue cube to the gripper
         when the jaws are *physically* closed (gripper qpos has reached the
-        close threshold) AND the cube is within range of the ee_site.
-        Releases when the jaws physically open. Triggering on actual qpos
-        (not the ctrl signal) means the cube doesn't snap to the gripper
-        before the jaws have moved.
+        close threshold) AND the cube is within range of the jaw-gap center
+        (grasp site). Releases when the jaws physically open. Triggering on
+        actual qpos (not the ctrl signal) means the cube doesn't snap to the
+        gripper before the jaws have moved.
 
         The SO-101 jaw spacing (~55 mm closed) is too wide to physically
         pinch a 25 mm cube, so we sidestep contact physics for the held
         state — the policy's image observation still sees the cube moving
-        naturally with the gripper.
+        naturally with the gripper. The cube is locked to the grasp site (the
+        point between the fingers) rather than the ee_site (which sits on the
+        fixed jaw), so the held cube stays centered in the jaws.
         """
         assert self.data is not None
         if self._gripper_qpos_idx < 0 or self._blue_qpos_start < 0:
             return
 
         grip_qpos = float(self.data.qpos[self._gripper_qpos_idx])
-        ee = self.ee_position()
+        grasp = self.grasp_position()
         blue_pos = self.data.xpos[self._blue_body_id]
 
         if not self._attached:
             if grip_qpos < self._grip_qpos_attach_threshold:
-                if np.linalg.norm(ee - blue_pos) < self._grip_attach_radius:
+                if np.linalg.norm(grasp - blue_pos) < self._grip_attach_radius:
                     self._attached = True
         else:
             if grip_qpos > self._grip_qpos_release_threshold:
                 self._attached = False
 
         if self._attached:
-            # Kinematically lock the cube to the ee with a small downward offset.
-            tgt = ee + np.array([0.0, 0.0, self._grip_cube_offset_z])
+            # Kinematically lock the cube to the jaw-gap center (between the
+            # fingers), with a small vertical offset to seat the cube center.
+            tgt = grasp + np.array([0.0, 0.0, self._grip_cube_offset_z])
             qi = self._blue_qpos_start
             self.data.qpos[qi:qi + 3] = tgt
             # Preserve orientation (identity quat); zero out velocity.
@@ -434,6 +451,16 @@ class SafeCubeEnv:
             return np.zeros(3)
         return self.data.site_xpos[self._ee_site_id].copy()
 
+    def grasp_position(self) -> np.ndarray:
+        """World position of the tool-center-point (jaw-gap center). This is
+        where a grasped cube sits, so the expert targets it for the
+        approach/descend/grasp phases. Falls back to the ee_site if the grasp
+        site is absent."""
+        assert self.data is not None
+        if self._grasp_site_id < 0:
+            return self.ee_position()
+        return self.data.site_xpos[self._grasp_site_id].copy()
+
     def gripper_qpos(self) -> float:
         """Current gripper joint position. Low = closed, high = open."""
         assert self.data is not None
@@ -455,11 +482,17 @@ class SafeCubeEnv:
 
     def ik_solve(self, ee_target: np.ndarray, *, damping: float = 0.2,
                   max_iters: int = 30, pos_tol: float = 0.003,
-                  max_dq: float = 0.4) -> np.ndarray:
+                  max_dq: float = 0.4, target_grasp_site: bool = False) -> np.ndarray:
         """Damped least-squares IK on a *copy* of MjData so we can iterate
-        without disturbing live physics. Returns absolute joint targets."""
+        without disturbing live physics. Returns absolute joint targets.
+
+        When ``target_grasp_site`` is set, solves so the jaw-gap center
+        (grasp site) reaches ``ee_target`` instead of the ee_site — used by
+        the grasp phases so the cube lands between the fingers."""
         assert self.model is not None and self.data is not None
         m = self.model
+        site_id = (self._grasp_site_id if target_grasp_site and self._grasp_site_id >= 0
+                   else self._ee_site_id)
         d = mujoco.MjData(m)
         d.qpos[:] = self.data.qpos
         d.qvel[:] = 0.0
@@ -472,11 +505,11 @@ class SafeCubeEnv:
         q = np.array([d.qpos[i] for i in arm_q_idx], dtype=np.float64)
 
         for _ in range(max_iters):
-            ee = d.site_xpos[self._ee_site_id].copy()
+            ee = d.site_xpos[site_id].copy()
             err = np.asarray(ee_target, dtype=np.float64) - ee
             if np.linalg.norm(err) < pos_tol:
                 break
-            mujoco.mj_jacSite(m, d, jacp, None, self._ee_site_id)
+            mujoco.mj_jacSite(m, d, jacp, None, site_id)
             J = jacp[:, cols]
             dq = J.T @ np.linalg.solve(J @ J.T + damp_eye, err)
             n = np.linalg.norm(dq)
