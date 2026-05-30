@@ -46,20 +46,18 @@ The SO-101 URDF + STL meshes are committed under `sim/assets/so101/`. The scene 
 
 ```bash
 # 1. View the scene with the scripted expert driving it
-uv run python -m sim.scripts.view_env --mjcf sim/assets/so101/so_arm101.xml
+uv run python -m sim.scripts.view_env
 
 # 2. Record 50 demos for the BC warm start
 uv run python -m sim.scripts.collect_demos \
     --repo-id local/safe-cube-bc \
     --root data/safe_cube_bc \
-    --mjcf sim/assets/so101/so_arm101.xml \
     --n-episodes 50 --successes-only
 
 # 3. Record a larger noisy set that contains failures (for the safety loss)
 uv run python -m sim.scripts.collect_demos \
     --repo-id local/safe-cube-mixed \
     --root data/safe_cube_mixed \
-    --mjcf sim/assets/so101/so_arm101.xml \
     --n-episodes 200
 ```
 
