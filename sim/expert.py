@@ -73,15 +73,14 @@ class ScriptedExpert:
         blue = np.asarray(privileged["blue_cube_pos"], dtype=np.float64)
         goal = np.asarray(privileged["goal_pos"], dtype=np.float64)
         reds = np.asarray(privileged["cube_positions"], dtype=np.float64)
-        # All Cartesian targets are expressed for the tool-center-point (the
-        # jaw-gap center / grasp site), i.e. where the cube actually sits — not
-        # the ee_site, which is on the fixed jaw ~3 cm to the side. This puts
-        # the cube between the fingers on grasp and makes the carry waypoints
-        # describe the cube's path directly.
-        tcp = self.env.grasp_position()
+        # Every phase steers the jaw-gap center (grasp site) — the point where
+        # the cube actually sits. The cube is grasped centered between the
+        # fingers and the carry waypoints then describe the cube's own path, so
+        # it weaves the cleared corridor between the obstacles directly.
+        ref = self.env.grasp_position()
 
-        target, self._grip, advance = self._target_for_phase(tcp, blue, goal, reds)
-        joint_cmd = self._ik_step(target)
+        target, self._grip, advance = self._target_for_phase(ref, blue, goal, reds)
+        joint_cmd = self._ik_step(target, target_grasp_site=True)
         self._phase_step += 1
         if advance:
             self._advance_phase()
@@ -94,21 +93,22 @@ class ScriptedExpert:
 
     def _target_for_phase(
         self,
-        tcp: np.ndarray, blue: np.ndarray, goal: np.ndarray, reds: np.ndarray,
+        ref: np.ndarray, blue: np.ndarray, goal: np.ndarray, reds: np.ndarray,
     ) -> tuple[np.ndarray, float, bool]:
-        """Return (tcp_target, gripper_cmd, advance).
+        """Return (target, gripper_cmd, advance).
 
-        Targets are *absolute* Cartesian goals for the tool-center-point (the
-        jaw-gap center) — the IK solves for the joints that put the TCP there
-        and the position controller drives over many env steps. `advance`
-        triggers on actual progress of the live TCP.
+        Targets are *absolute* Cartesian goals for the phase's reference point
+        (`ref`): the grasp site for grasp phases, the ee_site for carry phases.
+        The IK solves for the joints that put that point on the target and the
+        position controller drives over many env steps. `advance` triggers on
+        actual progress of the live reference point.
         """
         c = self.cfg
         reach_tol = 0.02   # 2 cm tolerance for most phases
 
         if self._phase is _Phase.APPROACH:
             tgt = np.array([blue[0], blue[1], blue[2] + c.pre_grasp_height])
-            return tgt, c.grip_open, np.linalg.norm(tcp - tgt) < reach_tol
+            return tgt, c.grip_open, np.linalg.norm(ref - tgt) < reach_tol
 
         if self._phase is _Phase.DESCEND:
             # Lower the open jaws down the SIDES of the cube so the fingertips
@@ -117,7 +117,7 @@ class ScriptedExpert:
             # absolute TCP (jaw-gap center) height calibrated to land the
             # fingertips at that depth.
             tgt = np.array([blue[0], blue[1], c.descend_grasp_z])
-            return tgt, c.grip_open, np.linalg.norm(tcp - tgt) < c.descend_reach_tol
+            return tgt, c.grip_open, np.linalg.norm(ref - tgt) < c.descend_reach_tol
 
         if self._phase is _Phase.CLOSE:
             # Hold pose, command the gripper closed, and wait until the jaws
@@ -132,15 +132,17 @@ class ScriptedExpert:
                 and self._phase_step - self._jaws_closed_at >= c.post_grasp_hold_steps
             )
             advance = (self._phase_step >= c.grasp_settle_steps and held_long_enough)
-            return tcp, c.grip_closed, advance
+            return ref, c.grip_closed, advance
 
         if self._phase is _Phase.LIFT:
             # Lift in place (hold XY, raise the cube to the absolute carry height).
-            tgt = np.array([tcp[0], tcp[1], c.carry_z])
-            return tgt, c.grip_closed, abs(tcp[2] - tgt[2]) < reach_tol
+            tgt = np.array([ref[0], ref[1], c.carry_z])
+            return tgt, c.grip_closed, abs(ref[2] - tgt[2]) < reach_tol
 
         if self._phase is _Phase.CARRY:
-            # Follow the BFS waypoints precomputed by the layout planner.
+            # Drive the held cube (grasp site) along the BFS waypoints, which the
+            # planner cleared by `path_clearance_radius` from every red. carry_z
+            # is set high enough that the gripper body clears the obstacle tops.
             # Advance to the next waypoint when within `waypoint_reach_tol`.
             wps = self.env.layout.carry_waypoints if self.env.layout else []
             if self._wp_idx >= len(wps):
@@ -148,13 +150,13 @@ class ScriptedExpert:
                 tgt = np.array([goal[0], goal[1], c.carry_z])
                 return tgt, c.grip_closed, True
             wp = wps[self._wp_idx]
-            if np.linalg.norm(tcp[:2] - wp) < c.waypoint_reach_tol:
+            if np.linalg.norm(ref[:2] - wp) < c.waypoint_reach_tol:
                 self._wp_idx = min(self._wp_idx + 1, len(wps) - 1)
                 wp = wps[self._wp_idx]
             tgt = np.array([wp[0], wp[1], c.carry_z])
             # CARRY advances once we're at the *final* waypoint (= goal_xy).
             done = (self._wp_idx == len(wps) - 1
-                    and np.linalg.norm(tcp[:2] - goal[:2]) < 0.03)
+                    and np.linalg.norm(ref[:2] - goal[:2]) < 0.03)
             return tgt, c.grip_closed, done
 
         if self._phase is _Phase.DESCEND2:
@@ -163,7 +165,7 @@ class ScriptedExpert:
             # jaw-gap center via the magnetic grip, so wherever the TCP is at
             # the moment of release determines where the cube lands.
             tgt = np.array([goal[0], goal[1], c.pre_release_z])
-            return tgt, c.grip_closed, np.linalg.norm(tcp - tgt) < c.descend2_reach_tol
+            return tgt, c.grip_closed, np.linalg.norm(ref - tgt) < c.descend2_reach_tol
 
         if self._phase is _Phase.OPEN:
             # Wait for the jaws to *physically* open past the release
@@ -171,9 +173,9 @@ class ScriptedExpert:
             grip_qpos = self.env.gripper_qpos()
             advance = (self._phase_step >= c.release_settle_steps
                        and grip_qpos > c.grasp_open_qpos_threshold)
-            return tcp, c.grip_open, advance
+            return ref, c.grip_open, advance
 
-        return tcp, self._grip, False
+        return ref, self._grip, False
 
     def _advance_phase(self) -> None:
         order = [
@@ -194,14 +196,14 @@ class ScriptedExpert:
             return target
         return p + d * min(1.0, max_step / n)
 
-    def _ik_step(self, tcp_target: np.ndarray) -> np.ndarray:
+    def _ik_step(self, target: np.ndarray, *, target_grasp_site: bool = True) -> np.ndarray:
         """Multi-iteration damped LS IK delegated to the env (which evaluates
         FK on a data copy). Solves so the grasp site (jaw-gap center) reaches
         the target."""
         return self.env.ik_solve(
-            tcp_target,
+            target,
             damping=max(self.cfg.ik_damping, 0.15),
             max_iters=self.cfg.ik_max_iters,
             pos_tol=self.cfg.ik_pos_tol,
-            target_grasp_site=True,
+            target_grasp_site=target_grasp_site,
         )

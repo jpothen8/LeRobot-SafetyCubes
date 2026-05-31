@@ -88,19 +88,26 @@ class SafeCubeEnv:
         self._blue_dof_start: int = -1
         # Magnetic-grip state.
         self._attached: bool = False
-        # Tunables for the grip proxy. The grasp activates only once the
-        # gripper joint has *physically* closed (qpos near grip_closed=-0.1),
-        # not on the ctrl signal — so the cube doesn't snap to the gripper
-        # before the jaws have moved.
-        # With grip_open ≈ 0.6, set release halfway between closed (-0.1) and
-        # open (0.6) → 0.40 rad. Hysteresis: attach < 0.20 closes; release > 0.40 opens.
-        self._grip_qpos_attach_threshold: float = 0.20
-        self._grip_qpos_release_threshold: float = 0.40
+        # Offset (cube_pos - grasp_site, in the grasp-site frame) captured at the
+        # instant of attach, so the catch introduces no jump.
+        self._grip_offset: np.ndarray = np.zeros(3)
+        # Where the cube should end up once fully gripped, expressed in the
+        # grasp-site frame: the center of the closed jaws. The grasp site is the
+        # OPEN-jaw fingertip gap (used to straddle on descent); as the jaws
+        # close, the moving jaw swings in and the held cube belongs at the jaw
+        # body center, ~2 cm in / 4.5 cm up the gripper from that fingertip
+        # point. We lerp the cube from its caught spot to here as the jaws close
+        # (grip qpos: attach→closed), so it's drawn *into* the gripper rather
+        # than frozen at first touch. Measured from the jaw-finger centroids.
+        self._grip_hold_offset: np.ndarray = np.array([0.0205, 0.001, -0.0458])
+        # Tunables for the grip proxy. We attach as soon as the jaws *start*
+        # closing while the grasp site is on the cube — early enough that the
+        # closing jaw can't shove the (light, free) cube across the table before
+        # it's caught. With grip_open ≈ 0.6, attach as qpos drops below 0.45;
+        # release > 0.55.
+        self._grip_qpos_attach_threshold: float = 0.45
+        self._grip_qpos_release_threshold: float = 0.55
         self._grip_attach_radius: float = 0.04
-        # Vertical offset between the grasp site (jaw-gap center) and the cube
-        # center while held. The grasp site sits at the fingertip plane and the
-        # cube center is essentially coincident with it, so this is ~0.
-        self._grip_cube_offset_z: float = 0.0
         self._ee_site_id: int = -1
         self._grasp_site_id: int = -1
         self._goal_site_id: int = -1
@@ -141,6 +148,7 @@ class SafeCubeEnv:
 
         # Reset magnetic-grip state for the new episode.
         self._attached = False
+        self._grip_offset = np.zeros(3)
 
         self._stats = EpisodeStats()
         return self._observe(), self._privileged()
@@ -345,20 +353,33 @@ class SafeCubeEnv:
 
         grip_qpos = float(self.data.qpos[self._gripper_qpos_idx])
         grasp = self.grasp_position()
+        # Grasp-site orientation: hold offsets are expressed in this frame so
+        # they track the gripper as it reorients during the carry.
+        R = self.data.site_xmat[self._grasp_site_id].reshape(3, 3) \
+            if self._grasp_site_id >= 0 else np.eye(3)
         blue_pos = self.data.xpos[self._blue_body_id]
 
         if not self._attached:
             if grip_qpos < self._grip_qpos_attach_threshold:
                 if np.linalg.norm(grasp - blue_pos) < self._grip_attach_radius:
                     self._attached = True
+                    # Capture where the cube sits (in the grasp-site frame) at
+                    # the instant of the catch, so it doesn't jump.
+                    self._grip_offset = R.T @ (np.asarray(blue_pos) - grasp)
         else:
             if grip_qpos > self._grip_qpos_release_threshold:
                 self._attached = False
 
         if self._attached:
-            # Kinematically lock the cube to the jaw-gap center (between the
-            # fingers), with a small vertical offset to seat the cube center.
-            tgt = grasp + np.array([0.0, 0.0, self._grip_cube_offset_z])
+            # Draw the cube from where it was caught toward the closed-jaw
+            # center as the jaws close (grip qpos: attach→closed maps 0→1), so
+            # it's pulled into the gripper instead of frozen at first touch.
+            span = self._grip_qpos_attach_threshold - self.cfg.scene.home_gripper
+            frac = float(np.clip(
+                (self._grip_qpos_attach_threshold - grip_qpos) / max(span, 1e-6),
+                0.0, 1.0))
+            local = self._grip_offset + frac * (self._grip_hold_offset - self._grip_offset)
+            tgt = grasp + R @ local
             qi = self._blue_qpos_start
             self.data.qpos[qi:qi + 3] = tgt
             # Preserve orientation (identity quat); zero out velocity.

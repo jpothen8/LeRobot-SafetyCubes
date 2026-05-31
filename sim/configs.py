@@ -46,8 +46,10 @@ class SceneConfig:
     min_cube_separation: float = 0.055
     # Larger safety margin specifically around the blue cube and goal — they
     # need clear approach/release space, so red cubes stay farther away from
-    # them than from each other.
-    blue_safety_radius: float = 0.085
+    # them than from each other. The blue margin is sized for the deep side
+    # grasp: the open SO-101 jaws straddle the cube and reach ~5-6 cm out, so
+    # reds must stay clear or the descending jaw clips a neighbouring cube.
+    blue_safety_radius: float = 0.115
     goal_safety_radius: float = 0.07
 
     # ── Blue cube spawn region (LEFT side of arm, outside red field) ─────
@@ -134,7 +136,10 @@ class SceneConfig:
     # center the cube between the fingers. Offset is in the gripper-frame body
     # frame, measured from the ee_site (see PR grasp-geometry probe).
     grasp_site_name: str = "grasp_site"
-    grasp_site_offset: tuple[float, float, float] = (0.03083, -0.00067, 0.0012)
+    # Expressed in the gripper-frame (ee_site) frame, which is rotated 180° about
+    # y from the gripper_link body frame — so x and z are negated relative to a
+    # gripper_link-frame measurement of the jaw-gap offset.
+    grasp_site_offset: tuple[float, float, float] = (-0.03083, -0.00067, -0.0012)
 
     # ── Home pose (per joint, radians) ───────────────────────────────────
     # Default folds the arm forward so the gripper hangs over the obstacle
@@ -182,10 +187,10 @@ class ExpertConfig:
     # lowering the open jaws down the SIDES of the cube. Calibrated so the
     # fingertips land at ~0.25x the cube height (≈6.3 mm above the table for a
     # 1-inch cube) — a realistic side grasp rather than perching on the cube
-    # top. The grasp site sits ~7 mm above the fingertips at the grasp pose,
-    # so 0.0134 → tips ≈ 0.0064 m.
-    descend_grasp_z: float = 0.0134
-    descend_reach_tol: float = 0.012    # settle close to the target depth
+    # top. The grasp site sits ~4-5 mm above the fingertips at the grasp pose,
+    # so 0.0110 → fingertips ≈ 0.0064 m (= 0.25 × the 1-inch cube).
+    descend_grasp_z: float = 0.0110
+    descend_reach_tol: float = 0.005    # settle close to the calibrated depth
 
     # CLOSE phase advances only once the gripper qpos drops below this
     # (jaws actually closed). Min in URDF is -0.174.
@@ -194,18 +199,21 @@ class ExpertConfig:
     # generic 2 cm so the drop lands close to the goal patch center.
     descend2_reach_tol: float = 0.012
     # OPEN phase advances only once the gripper qpos has risen above this
-    # (jaws actually open enough to release the cube).
-    grasp_open_qpos_threshold: float = 0.45
+    # (jaws actually open enough to release the cube). Kept ≥ the env's grip
+    # release threshold (0.55) so the cube is physically released *before* OPEN
+    # ends, not during the post-episode settle.
+    grasp_open_qpos_threshold: float = 0.55
 
-    # ABSOLUTE world-frame z for the held cube (jaw-gap center) during the
-    # lift/carry/release phases. The cube is locked to the grasp site, so these
-    # are the cube-center heights directly. Set so the carried cube rides at
-    # the same height as the red obstacles (cube center ≈ red-top height),
-    # which is what "weave between" actually means — anything higher means the
-    # trajectory clears the obstacle field by going over it. The ee_site (fixed
-    # jaw) rides above the cube and stays under SceneConfig.ee_height_ceiling.
-    carry_z: float = 0.028
-    pre_release_z: float = 0.016
+    # ABSOLUTE cube-center z during LIFT/CARRY. Every phase steers the grasp
+    # site (= held cube), so this is the cube height directly. The cube weaves
+    # the cleared corridor *between* the obstacles in XY; the height is set just
+    # high enough that the side-grasping gripper's body clears the ~25 mm red
+    # tops (lower and a finger dips into a neighbour). The ee_site stays well
+    # below ee_height_ceiling (0.060) at this carry height.
+    carry_z: float = 0.042
+    # ABSOLUTE cube-center z at release: DESCEND2 steers the grasp site (= cube)
+    # down to the goal at this height for a gentle drop into the goal square.
+    pre_release_z: float = 0.022
 
     # Waypoint following during CARRY: advance to the next BFS waypoint when
     # the TCP (held cube) is within this XY tolerance of it.
