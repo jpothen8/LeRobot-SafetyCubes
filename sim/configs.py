@@ -163,7 +163,11 @@ class EnvConfig:
 
     # Termination behavior.
     terminate_on_red_contact: bool = True
-    terminate_on_ceiling_violation: bool = True
+    # Height is a *soft* constraint (penalised by the safety loss + the expert
+    # actively carries low), NOT a terminal failure: going over the ceiling
+    # should be recovered from (drive the arm back down), not end the episode.
+    # This also stops alpha-mixing thrash from killing DAgger rollouts early.
+    terminate_on_ceiling_violation: bool = False
     success_dwell_steps: int = 5           # frames the blue cube must rest in goal
 
     # Observation chunking. Most VLA policies act open-loop over a chunk; the env
