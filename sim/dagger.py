@@ -27,6 +27,7 @@ import sim.safe_pi0_policy  # noqa: F401  -- registers `safe_pi0` with draccus
 from sim.env import SafeCubeEnv
 from sim.expert import ScriptedExpert
 from sim.recorder import EpisodeRecorder
+from sim.rollout import run_expert_episode
 
 
 @dataclass
@@ -119,6 +120,19 @@ class PolicyRollout:
         action = self.postprocessor(action)              # un-normalized raw joints
         return action.squeeze(0).to("cpu").numpy()
 
+    def act_queued(self, obs: dict, task: str) -> np.ndarray:
+        """Like :meth:`act` but WITHOUT the per-step queue reset, so
+        ``select_action`` executes the predicted action chunk before re-planning
+        — the exact closed-loop path used at deployment/eval. Call
+        :meth:`reset` once per episode. Use this to *generate* DAgger rollout
+        states so they match the deployment distribution.
+        """
+        batch = self.preprocessor(self._format(obs, task))
+        with torch.inference_mode():
+            action = self.policy.select_action(batch)
+        action = self.postprocessor(action)
+        return action.squeeze(0).to("cpu").numpy()
+
 
 def collect_dagger_round(
     *,
@@ -151,38 +165,23 @@ def collect_dagger_round(
     stats = RoundStats(alpha=alpha)
     pure_expert = policy is None or alpha >= 1.0
 
+    def choose_executed(expert_action: np.ndarray, obs: dict, info: dict) -> np.ndarray:
+        # Execute the expert w.p. alpha, else the policy rolled the SAME (queued)
+        # way it is deployed, so DAgger visits the deployment distribution. The
+        # label recorded inside run_expert_episode is always the expert action.
+        if rng.random() < alpha:
+            return expert_action
+        return policy.act_queued(obs, task)
+
     for ep in range(n_episodes):
-        obs, info = env.reset(seed=base_seed + ep)
-        expert.reset()
         if policy is not None:
-            policy.reset()
-        rec.begin_episode(task=task)
-
-        terminated = truncated = False
-        settle_budget = max(int(env.cfg.fps), env.cfg.success_dwell_steps + 5)
-        settle_left = settle_budget
-        while not (terminated or truncated):
-            if expert.done():
-                if settle_left <= 0:
-                    break
-                settle_left -= 1
-                # Hold pose, gripper open, so the dwell window can register and
-                # the released cube is not re-grabbed by the magnetic grip.
-                expert_action = np.concatenate([env.joint_positions(), [grip_open]])
-            else:
-                expert_action = expert.act(info)
-
-            if pure_expert:
-                executed = expert_action
-            else:
-                use_expert = rng.random() < alpha
-                executed = expert_action if use_expert else policy.act(obs, task)
-
-            # DAgger: record the expert label at the visited state.
-            rec.add(obs, expert_action, info)
-            obs, _, terminated, truncated, info = env.step(executed)
-
-        s = info["stats"]
+            policy.reset()  # reset the action queue once per episode (queued rollout)
+        # SAME expert path as sim.scripts.collect_demos -> identical labels.
+        s = run_expert_episode(
+            env=env, expert=expert, rec=rec, task=task,
+            seed=base_seed + ep, grip_open=grip_open,
+            choose_executed=None if pure_expert else choose_executed,
+        )
         stats.episodes += 1
         stats.successes += int(s["success"])
         stats.red_contacts += int(s["red_contact"])

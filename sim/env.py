@@ -21,11 +21,19 @@ action-chunking inference.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import mujoco
+# Render headlessly on the GPU via EGL. Without this, MuJoCo binds a
+# display-backed GLX context to $DISPLAY (e.g. an AnyDesk virtual display like
+# :1); when that remote session disconnects or sleeps the framebuffer goes
+# black, which silently corrupted ~60-68% of earlier collected datasets. EGL is
+# independent of any X display. setdefault lets an interactive viewer override.
+os.environ.setdefault("MUJOCO_GL", "egl")
+
+import mujoco  # noqa: E402  (must follow the MUJOCO_GL default above)
 import numpy as np
 
 from .configs import EnvConfig, SceneConfig
@@ -122,7 +130,13 @@ class SafeCubeEnv:
         self.data = mujoco.MjData(self.model)
 
         H, W = self.cfg.scene.image_size
-        # Recreate renderer per reset since the model changed.
+        # Recreate renderer per reset since the model changed. Close the old one
+        # FIRST: leaking a Renderer (and its GL/EGL context + framebuffer) every
+        # reset exhausts the driver's offscreen resources after a few hundred
+        # episodes, after which renders silently come back all-black. That leak
+        # corrupted ~60-68% of the safe_cube_v3 / safe_cube_dagger datasets.
+        if self.renderer is not None:
+            self.renderer.close()
         self.renderer = mujoco.Renderer(self.model, height=H, width=W)
 
         self._cache_indices()

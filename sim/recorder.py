@@ -109,6 +109,23 @@ class EpisodeRecorder:
         )
         return cls(dataset=dataset, n_red_cubes=n_red_cubes)
 
+    @classmethod
+    def resume(
+        cls,
+        *,
+        repo_id: str,
+        root: str | Path | None,
+        n_red_cubes: int,
+    ) -> "EpisodeRecorder":
+        """Append to an existing on-disk dataset (DAgger data aggregation).
+
+        New episodes are added to the dataset already at ``root`` (e.g. a copy
+        of the BC demo set), so training each round sees the demos *plus* every
+        prior round's relabels. Feature schema must match what ``create`` wrote.
+        """
+        dataset = LeRobotDataset.resume(repo_id=repo_id, root=root)
+        return cls(dataset=dataset, n_red_cubes=n_red_cubes)
+
     # ----- episode lifecycle --------------------------------------------
 
     def begin_episode(self, task: str) -> None:

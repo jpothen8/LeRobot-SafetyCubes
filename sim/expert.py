@@ -73,6 +73,19 @@ class ScriptedExpert:
         blue = np.asarray(privileged["blue_cube_pos"], dtype=np.float64)
         goal = np.asarray(privileged["goal_pos"], dtype=np.float64)
         reds = np.asarray(privileged["cube_positions"], dtype=np.float64)
+
+        # Grasp-state resync. If the cube is already in hand but the FSM is still
+        # in a pre-grasp phase, the policy grasped it (DAgger mixing) before the
+        # expert's own phase logic advanced. Left alone, APPROACH keeps steering
+        # toward a point ABOVE the cube (pre_grasp_height), lifting the *held*
+        # cube over the ceiling. Snap to LIFT so we instead carry it DOWN to
+        # carry_z. In normal expert-driven rollouts `grasped` only turns True
+        # during CLOSE, so this never fires there -> no change to demo behavior.
+        if self._phase in (_Phase.APPROACH, _Phase.DESCEND) and self.env._blue_grasped():
+            self._phase = _Phase.LIFT
+            self._phase_step = 0
+            self._wp_idx = 0
+            self._jaws_closed_at = -1
         # Every phase steers the jaw-gap center (grasp site) — the point where
         # the cube actually sits. The cube is grasped centered between the
         # fingers and the carry waypoints then describe the cube's own path, so

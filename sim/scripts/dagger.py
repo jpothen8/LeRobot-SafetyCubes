@@ -59,6 +59,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps", type=int, default=8000)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--gradient-checkpointing", action="store_true", default=True)
+    p.add_argument("--num-workers", type=int, default=16)
+    p.add_argument("--save-freq", type=int, default=2000)
+    p.add_argument("--log-freq", type=int, default=100)
+    # Build-on-existing options (DAgger from a trained model + its dataset).
+    p.add_argument("--resume-dataset", action="store_true",
+                   help="append to the existing dataset already at --root (e.g. a copy of the BC "
+                        "demo set) instead of creating a fresh one — proper DAgger aggregation")
+    p.add_argument("--rollout-from-base", action="store_true",
+                   help="--base-policy is a trained checkpoint: roll it (expert-mixed) from round 0 "
+                        "with alpha = alpha0 ** (round+1), skipping a pure-expert round 0")
     p.add_argument("--no-train", action="store_true", help="collect only; skip retraining")
     p.add_argument("--print-only", action="store_true", help="print train commands without running")
     return p.parse_args()
@@ -79,6 +89,10 @@ def _train_command(args: argparse.Namespace, pretrained_path: str, output_dir: P
         f"--steps={args.steps}",
         f"--batch_size={args.batch_size}",
         f"--seed={args.seed}",
+        "--policy.push_to_hub=false",          # else validate() errors on missing repo_id
+        f"--num_workers={args.num_workers}",
+        f"--save_freq={args.save_freq}",
+        f"--log_freq={args.log_freq}",
     ]
     if args.root is not None:
         cmd.append(f"--dataset.root={args.root}")
@@ -98,24 +112,37 @@ def main() -> None:
     obs, _ = env.reset(seed=args.seed)
     state_dim = obs["state"].shape[0]
 
-    rec = EpisodeRecorder.create(
-        repo_id=args.repo_id,
-        root=args.root,
-        n_red_cubes=args.n_red_cubes,
-        image_size=scene.image_size,
-        action_dim=env.action_dim,
-        state_dim=state_dim,
-        fps=env.cfg.fps,
-    )
+    if args.resume_dataset:
+        # Append onto the existing dataset at --root (e.g. a copy of the BC demo
+        # set) so each round trains on demos + all prior relabels (aggregation).
+        rec = EpisodeRecorder.resume(
+            repo_id=args.repo_id, root=args.root, n_red_cubes=args.n_red_cubes,
+        )
+    else:
+        rec = EpisodeRecorder.create(
+            repo_id=args.repo_id,
+            root=args.root,
+            n_red_cubes=args.n_red_cubes,
+            image_size=scene.image_size,
+            action_dim=env.action_dim,
+            state_dim=state_dim,
+            fps=env.cfg.fps,
+        )
     expert = ScriptedExpert(env=env, cfg=ExpertConfig())
     grip_open = ExpertConfig().grip_open
 
     prev_ckpt = args.base_policy
     for r in range(args.rounds):
-        alpha = args.alpha0 ** r
-        # Round 0 is pure expert; later rounds load the previous checkpoint.
+        if args.rollout_from_base:
+            # Build on a trained base policy: mix it in from round 0.
+            alpha = args.alpha0 ** (r + 1)
+            load_policy = True
+        else:
+            # Original: round 0 is a pure-expert BC warm start, later rounds mix.
+            alpha = args.alpha0 ** r
+            load_policy = r > 0
         policy = None
-        if r > 0:
+        if load_policy:
             policy = PolicyRollout(
                 checkpoint=prev_ckpt,
                 dataset_repo_id=args.repo_id,
