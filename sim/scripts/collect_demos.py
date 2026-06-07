@@ -72,6 +72,7 @@ def main() -> None:
 
     saved = 0
     discarded = 0
+    discarded_flyover = 0
     for ep in range(args.n_episodes):
         # Shared expert path (choose_executed=None -> execute the expert: this IS
         # the demonstration). DAgger relabeling uses the exact same loop.
@@ -79,16 +80,22 @@ def main() -> None:
             env=env, expert=expert, rec=rec, task=TASK_DESCRIPTION,
             seed=args.seed + ep, grip_open=grip_open,
         )
-        if args.successes_only and not stats["success"]:
+        # Always drop fly-overs (a demo of going *over* an obstacle is poison for
+        # the stay-low task); drop failures too under --successes-only. fly_over
+        # is belt-and-suspenders — at the low carry height it should never fire.
+        fell_over = bool(stats.get("fly_over", False))
+        if fell_over or (args.successes_only and not stats["success"]):
             rec.discard_episode()
             discarded += 1
+            discarded_flyover += int(fell_over)
         else:
             n = rec.save_episode()
             saved += 1
             print(f"[ep {ep:03d}] frames={n} stats={stats}")
     env.close()
     rec.finalize()
-    print(f"\nDone. saved={saved}  discarded={discarded}  -> {args.root or '$HF_LEROBOT_HOME'}")
+    print(f"\nDone. saved={saved}  discarded={discarded} (fly_over={discarded_flyover})  "
+          f"-> {args.root or '$HF_LEROBOT_HOME'}")
 
 
 if __name__ == "__main__":

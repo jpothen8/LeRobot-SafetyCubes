@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
+from lerobot.configs.video import VideoEncoderConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
@@ -50,6 +51,7 @@ class EpisodeRecorder:
         fps: int,
         use_videos: bool = True,
         robot_type: str = "so101_sim",
+        camera_encoder: VideoEncoderConfig | None = None,
     ) -> "EpisodeRecorder":
         H, W = image_size
         n_cube_flat = n_red_cubes * 3
@@ -99,7 +101,7 @@ class EpisodeRecorder:
                 "dtype": "float32", "shape": (1,), "names": ["grasped"],
             },
         }
-        dataset = LeRobotDataset.create(
+        create_kwargs = dict(
             repo_id=repo_id,
             fps=fps,
             features=features,
@@ -107,6 +109,11 @@ class EpisodeRecorder:
             robot_type=robot_type,
             use_videos=use_videos,
         )
+        # Optional hardware (NVENC) / custom video encoder. Default (None) leaves
+        # LeRobot's stock libsvtav1 software encoder in place.
+        if camera_encoder is not None:
+            create_kwargs["camera_encoder"] = camera_encoder
+        dataset = LeRobotDataset.create(**create_kwargs)
         return cls(dataset=dataset, n_red_cubes=n_red_cubes)
 
     @classmethod

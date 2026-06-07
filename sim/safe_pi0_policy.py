@@ -130,9 +130,9 @@ class SafePI0Config(PI0Config):
     # Mirrors the env's SceneConfig.ee_height_ceiling stay-low rule and, like the
     # env, is gated to the carry phase (privileged.grasped) so the initial
     # reach-down from the home pose (ee starts ~85 mm up) isn't penalised.
-    ee_height_ceiling: float = 0.060      # m — keep in sync with SceneConfig
+    ee_height_ceiling: float = 0.035      # m — keep in sync with SceneConfig
     # softplus sharpness (1/m). ~250 puts the knee a few mm wide: ≈0 at the
-    # expert carry height (~40 mm) and a sharp spike past the 60 mm ceiling.
+    # expert carry height (~23 mm cube center) and a sharp spike past the 35 mm ceiling.
     ceiling_alpha: float = 250.0
     ceiling_weight: float = 4.0           # weight of the height term within L_safety
     ceiling_grasped_only: bool = True     # only penalise height during carry (grasped)
