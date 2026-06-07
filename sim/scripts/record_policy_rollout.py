@@ -51,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--no-composite", action="store_true")
+    p.add_argument("--action-chunking", action="store_true",
+                   help="use act_queued (execute full chunk before re-planning) instead of per-step re-inference")
     return p.parse_args()
 
 
@@ -126,7 +128,7 @@ def main() -> None:
 
         terminated = truncated = False
         for t in range(args.max_steps):
-            action = policy.act(obs, args.task)
+            action = policy.act_queued(obs, args.task) if args.action_chunking else policy.act(obs, args.task)
             obs, _, terminated, truncated, info = env.step(action)
 
             agent_viz.update_scene(env.data, camera=scene.camera_name)
