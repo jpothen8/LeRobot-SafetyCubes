@@ -86,10 +86,9 @@ class ScriptedExpert:
             self._phase_step = 0
             self._wp_idx = 0
             self._jaws_closed_at = -1
-        # Every phase steers the jaw-gap center (grasp site) — the point where
-        # the cube actually sits. The cube is grasped centered between the
-        # fingers and the carry waypoints then describe the cube's own path, so
-        # it weaves the cleared corridor between the obstacles directly.
+        # ref is the grasp site (jaw-gap center). Pre-grasp phases target it
+        # directly; CARRY/DESCEND2 back-correct the IK target so the actual
+        # cube center (not the TCP) follows the cleared corridor.
         ref = self.env.grasp_position()
 
         target, self._grip, advance = self._target_for_phase(ref, blue, goal, reds)
@@ -110,11 +109,10 @@ class ScriptedExpert:
     ) -> tuple[np.ndarray, float, bool]:
         """Return (target, gripper_cmd, advance).
 
-        Targets are *absolute* Cartesian goals for the phase's reference point
-        (`ref`): the grasp site for grasp phases, the ee_site for carry phases.
-        The IK solves for the joints that put that point on the target and the
-        position controller drives over many env steps. `advance` triggers on
-        actual progress of the live reference point.
+        `target` is the absolute Cartesian position the IK should put the
+        grasp site at. Pre-grasp phases pass waypoints directly; CARRY and
+        DESCEND2 subtract the cube→grasp offset so the cube center tracks
+        the goal, not the TCP. `advance` triggers on actual progress.
         """
         c = self.cfg
         reach_tol = 0.02   # 2 cm tolerance for most phases
@@ -124,11 +122,6 @@ class ScriptedExpert:
             return tgt, c.grip_open, np.linalg.norm(ref - tgt) < reach_tol
 
         if self._phase is _Phase.DESCEND:
-            # Lower the open jaws down the SIDES of the cube so the fingertips
-            # reach ~0.25x the cube height — a realistic side grasp, not a
-            # gripper perched on top of the cube. `descend_grasp_z` is the
-            # absolute TCP (jaw-gap center) height calibrated to land the
-            # fingertips at that depth.
             tgt = np.array([blue[0], blue[1], c.descend_grasp_z])
             return tgt, c.grip_open, np.linalg.norm(ref - tgt) < c.descend_reach_tol
 
@@ -153,32 +146,38 @@ class ScriptedExpert:
             return tgt, c.grip_closed, abs(ref[2] - tgt[2]) < reach_tol
 
         if self._phase is _Phase.CARRY:
-            # Drive the held cube (grasp site) along the BFS waypoints, which the
-            # planner cleared by `path_clearance_radius` from every red. carry_z
-            # is set high enough that the gripper body clears the obstacle tops.
-            # Advance to the next waypoint when within `waypoint_reach_tol`.
+            # Drive the held cube along the BFS waypoints. The BFS corridor is
+            # cleared for the CUBE CENTER, so we track and target the cube itself
+            # (not the grasp site). The cube center sits at grasp_site + offset
+            # where offset = _grip_hold_offset rotated into world frame; correct
+            # the IK target so the cube lands on the waypoint, not the grasp site.
             wps = self.env.layout.carry_waypoints if self.env.layout else []
             if self._wp_idx >= len(wps):
-                # Defensive fallback (shouldn't normally happen).
                 tgt = np.array([goal[0], goal[1], c.carry_z])
                 return tgt, c.grip_closed, True
+            cube_pos = self.env.blue_cube_position()
+            cube_xy = cube_pos[:2]
             wp = wps[self._wp_idx]
-            if np.linalg.norm(ref[:2] - wp) < c.waypoint_reach_tol:
+            if np.linalg.norm(cube_xy - wp) < c.waypoint_reach_tol:
                 self._wp_idx = min(self._wp_idx + 1, len(wps) - 1)
                 wp = wps[self._wp_idx]
-            tgt = np.array([wp[0], wp[1], c.carry_z])
-            # CARRY advances once we're at the *final* waypoint (= goal_xy).
+            # Shift the grasp-site target by the current cube→grasp offset so
+            # the cube center tracks the waypoint rather than the TCP.
+            offset = cube_pos - ref  # world-frame: grasp_site → cube_center
+            tgt = np.array([wp[0] - offset[0], wp[1] - offset[1], c.carry_z - offset[2]])
+            # CARRY advances once the cube is at the final waypoint (= goal_xy).
             done = (self._wp_idx == len(wps) - 1
-                    and np.linalg.norm(ref[:2] - goal[:2]) < 0.03)
+                    and np.linalg.norm(cube_xy - goal[:2]) < 0.03)
             return tgt, c.grip_closed, done
 
         if self._phase is _Phase.DESCEND2:
-            # Hover the held cube over the goal CENTER and only release when
-            # actually centered (tight XY tolerance). The cube is glued to the
-            # jaw-gap center via the magnetic grip, so wherever the TCP is at
-            # the moment of release determines where the cube lands.
-            tgt = np.array([goal[0], goal[1], c.pre_release_z])
-            return tgt, c.grip_closed, np.linalg.norm(ref - tgt) < c.descend2_reach_tol
+            # Hover the cube over the goal CENTER. Correct for the cube→grasp offset
+            # so the cube center (not the TCP) lands on the goal.
+            cube_pos = self.env.blue_cube_position()
+            offset = cube_pos - ref
+            tgt = np.array([goal[0] - offset[0], goal[1] - offset[1], c.pre_release_z - offset[2]])
+            done = np.linalg.norm(cube_pos - np.array([goal[0], goal[1], c.pre_release_z])) < c.descend2_reach_tol
+            return tgt, c.grip_closed, done
 
         if self._phase is _Phase.OPEN:
             # Wait for the jaws to *physically* open past the release

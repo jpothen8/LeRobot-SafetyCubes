@@ -45,6 +45,7 @@ class EpisodeStats:
     steps: int = 0
     red_contact: bool = False
     ceiling_violation: bool = False
+    fly_over: bool = False
     blue_dropped: bool = False
     success: bool = False
     dwell: int = 0
@@ -57,6 +58,7 @@ class EpisodeStats:
             "steps": self.steps,
             "red_contact": bool(self.red_contact),
             "ceiling_violation": bool(self.ceiling_violation),
+            "fly_over": bool(self.fly_over),
             "blue_dropped": bool(self.blue_dropped),
             "success": bool(self.success),
             "dwell": self.dwell,
@@ -99,22 +101,31 @@ class SafeCubeEnv:
         # Offset (cube_pos - grasp_site, in the grasp-site frame) captured at the
         # instant of attach, so the catch introduces no jump.
         self._grip_offset: np.ndarray = np.zeros(3)
-        # Where the cube should end up once fully gripped, expressed in the
-        # grasp-site frame: the center of the closed jaws. The grasp site is the
-        # OPEN-jaw fingertip gap (used to straddle on descent); as the jaws
-        # close, the moving jaw swings in and the held cube belongs at the jaw
-        # body center, ~2 cm in / 4.5 cm up the gripper from that fingertip
-        # point. We lerp the cube from its caught spot to here as the jaws close
-        # (grip qpos: attach→closed), so it's drawn *into* the gripper rather
-        # than frozen at first touch. Measured from the jaw-finger centroids.
-        self._grip_hold_offset: np.ndarray = np.array([0.0205, 0.001, -0.0458])
+        # Minimum grip qpos seen while attached — used to prevent the lerp from
+        # running backwards (dragging the cube back toward the open-jaw position
+        # as the jaw opens). frac is computed from this rather than live qpos, so
+        # it only ever increases and the cube stays at _grip_hold_offset until release.
+        self._min_grip_qpos: float = float("inf")
+        # Where the cube should sit once the jaws are fully closed, in the
+        # grasp-site frame. The grasp site is the gap center for the *open*
+        # jaws; as the jaws close the fixed jaw stays put while the moving jaw
+        # swings in, so the true center-between-the-fingers drifts toward the
+        # fixed jaw along the grasp-frame x (jaw-opening) axis. We lerp the cube
+        # along that drift as the jaws close (grip qpos: attach→closed) so it
+        # stays centered between the fingers instead of ending up outside the
+        # closed jaws. Measured by tracking the live gap center (midpoint of the
+        # fixed-jaw face and the FK'd moving-jaw face) from open→closed: it moves
+        # +0.0255 m in x and only ~+0.003 m in z. CRITICAL: the z component is
+        # ~0 — the center does NOT move up the finger axis. An earlier value of
+        # z=-0.0458 dragged the cube ~4.5 cm up the gripper as the jaws closed
+        # (the cube visibly "rode up" the gripper); that was wrong.
+        self._grip_hold_offset: np.ndarray = np.array([0.0255, -0.0117, 0.003])
         # Tunables for the grip proxy. We attach as soon as the jaws *start*
         # closing while the grasp site is on the cube — early enough that the
         # closing jaw can't shove the (light, free) cube across the table before
         # it's caught. With grip_open ≈ 0.6, attach as qpos drops below 0.45;
-        # release > 0.55.
+        # release > attach threshold (immediately on jaw opening).
         self._grip_qpos_attach_threshold: float = 0.45
-        self._grip_qpos_release_threshold: float = 0.55
         self._grip_attach_radius: float = 0.04
         self._ee_site_id: int = -1
         self._grasp_site_id: int = -1
@@ -156,6 +167,15 @@ class SafeCubeEnv:
             self.data.ctrl[self._gripper_ctrl_idx] = sc.home_gripper
         mujoco.mj_forward(self.model, self.data)
 
+        # Yaw the (fixed-position) blue cube so its vertical faces meet the
+        # gripper jaws square-on. The arm reaches the grasp pose with a fixed
+        # jaw-opening axis (it depends only on the fixed cube position + home
+        # pose); we yaw the cube to that axis so the faces are parallel to the
+        # jaws as they descend. Together with the held-cube yaw tracking in
+        # _update_grasp this keeps the cube fully inside the jaws (no corner
+        # poking out in XY) through the whole carry.
+        self._set_blue_spawn_pose()
+
         # Settle physics so cubes rest on the table before first observation.
         for _ in range(20):
             mujoco.mj_step(self.model, self.data)
@@ -163,6 +183,7 @@ class SafeCubeEnv:
         # Reset magnetic-grip state for the new episode.
         self._attached = False
         self._grip_offset = np.zeros(3)
+        self._min_grip_qpos = float("inf")
 
         self._stats = EpisodeStats()
         return self._observe(), self._privileged()
@@ -346,6 +367,43 @@ class SafeCubeEnv:
         """Magnetic-grip state. Set/cleared by _update_grasp()."""
         return self._attached
 
+    def _blue_grasp_yaw(self) -> float:
+        """Yaw (rad, about world +z) of the gripper's jaw-opening axis at the
+        moment it descends on the blue cube.
+
+        Solved by IK'ing the jaw-gap center (grasp site) onto the blue cube's
+        resting position from the home pose, then reading the resulting
+        grasp-site orientation. The jaw-opening axis is the grasp frame's local
+        x (the axis along which the magnetic grip centers the cube — see
+        _grip_hold_offset), so its world projection gives the yaw the cube's
+        faces must match to sit square in the jaws."""
+        assert self.data is not None and self.model is not None
+        if self._blue_body_id < 0 or self._grasp_site_id < 0:
+            return 0.0
+        blue_pos = self.data.xpos[self._blue_body_id].copy()
+        q = self.ik_solve(blue_pos, damping=0.15, max_iters=40,
+                          pos_tol=0.003, target_grasp_site=True)
+        d = mujoco.MjData(self.model)
+        d.qpos[:] = self.data.qpos
+        for k, qi in enumerate(self._arm_qpos_idx):
+            d.qpos[qi] = q[k]
+        mujoco.mj_forward(self.model, d)
+        jaw_axis = d.site_xmat[self._grasp_site_id].reshape(3, 3)[:, 0]
+        return float(np.arctan2(jaw_axis[1], jaw_axis[0]))
+
+    def _set_blue_spawn_pose(self) -> None:
+        """Yaw the blue cube (kept upright) so its faces are parallel to the
+        gripper jaws on the approach. Position is already fixed by the layout;
+        this only rewrites the cube freejoint's orientation quat."""
+        assert self.data is not None
+        if self._blue_qpos_start < 0:
+            return
+        yaw = self._blue_grasp_yaw()
+        qi = self._blue_qpos_start
+        self.data.qpos[qi + 3:qi + 7] = np.array(
+            [np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)])
+        mujoco.mj_forward(self.model, self.data)
+
     def _update_grasp(self) -> None:
         """Magnetic-grip controller. Attaches the blue cube to the gripper
         when the jaws are *physically* closed (gripper qpos has reached the
@@ -377,27 +435,40 @@ class SafeCubeEnv:
             if grip_qpos < self._grip_qpos_attach_threshold:
                 if np.linalg.norm(grasp - blue_pos) < self._grip_attach_radius:
                     self._attached = True
-                    # Capture where the cube sits (in the grasp-site frame) at
-                    # the instant of the catch, so it doesn't jump.
                     self._grip_offset = R.T @ (np.asarray(blue_pos) - grasp)
+                    self._min_grip_qpos = grip_qpos
         else:
-            if grip_qpos > self._grip_qpos_release_threshold:
+            # Release as soon as the jaw opens past the attach threshold — no
+            # need for a separate higher threshold now that the lerp never runs
+            # backwards during opening.
+            if grip_qpos > self._grip_qpos_attach_threshold:
                 self._attached = False
 
         if self._attached:
-            # Draw the cube from where it was caught toward the closed-jaw
-            # center as the jaws close (grip qpos: attach→closed maps 0→1), so
-            # it's pulled into the gripper instead of frozen at first touch.
+            # Keep the cube centered between the fingers as the jaws close:
+            # lerp from where it was caught toward the closed-jaw center as grip
+            # qpos goes attach→home (frac 0→1). We use _min_grip_qpos (the
+            # lowest qpos seen while attached) instead of the live qpos so frac
+            # only ever increases — the cube moves toward _grip_hold_offset as
+            # the jaws close but never drifts back toward the open-jaw position
+            # as the jaws open.
+            self._min_grip_qpos = min(self._min_grip_qpos, grip_qpos)
             span = self._grip_qpos_attach_threshold - self.cfg.scene.home_gripper
             frac = float(np.clip(
-                (self._grip_qpos_attach_threshold - grip_qpos) / max(span, 1e-6),
+                (self._grip_qpos_attach_threshold - self._min_grip_qpos) / max(span, 1e-6),
                 0.0, 1.0))
             local = self._grip_offset + frac * (self._grip_hold_offset - self._grip_offset)
             tgt = grasp + R @ local
             qi = self._blue_qpos_start
             self.data.qpos[qi:qi + 3] = tgt
-            # Preserve orientation (identity quat); zero out velocity.
-            self.data.qpos[qi + 3:qi + 7] = np.array([1.0, 0.0, 0.0, 0.0])
+            # Yaw-align the held cube to the gripper's jaw-opening axis (grasp
+            # frame local x) so its faces stay parallel to the jaws and it sits
+            # fully inside them — no corner poking out in XY — as the wrist
+            # sweeps through the carry. Kept upright (yaw only): the cube tracks
+            # the jaw yaw but never tilts. Velocity zeroed.
+            yaw = float(np.arctan2(R[1, 0], R[0, 0]))
+            self.data.qpos[qi + 3:qi + 7] = np.array(
+                [np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)])
             vi = self._blue_dof_start
             self.data.qvel[vi:vi + 6] = 0.0
 
@@ -420,9 +491,32 @@ class SafeCubeEnv:
                 self._stats.contact_history.append(name)
 
         # 2. Ceiling violation — only enforced once the cube is grasped (carry phase).
+        # Checks the HELD CUBE's z position, not the TCP/ee, because the TCP sits
+        # ~10 mm above the cube center and would false-fire at normal carry heights.
+        # Threshold is the cube-center height at which the cube bottom would clear
+        # a red cube top (fly-over): red_top + blue_half ≈ 0.025 + 0.013 = 0.038 m,
+        # so ee_height_ceiling=0.035 gives ~3 mm margin before a true fly-over.
         ee_pos = d.site_xpos[self._ee_site_id] if self._ee_site_id >= 0 else None
-        if ee_pos is not None and self._blue_grasped() and ee_pos[2] > sc.ee_height_ceiling:
-            self._stats.ceiling_violation = True
+        if self._blue_grasped():
+            cube_z = d.xpos[self._blue_body_id][2]
+            if cube_z > sc.ee_height_ceiling:
+                self._stats.ceiling_violation = True
+
+        # 2b. Fly-over: while carrying, the held cube is laterally over a red's
+        # footprint AND its bottom clears the red's top — i.e. passing *over* an
+        # obstacle instead of weaving between. Geometric, so it catches marginal
+        # cases the ee-height ceiling can miss (the ee sits a few mm below the
+        # held cube).
+        if self._blue_grasped() and len(self._red_body_ids) > 0:
+            bpos = d.xpos[self._blue_body_id]
+            bh, rh = sc.blue_cube_half, sc.red_cube_half
+            for bid in self._red_body_ids:
+                rc = d.xpos[bid]
+                if (abs(bpos[0] - rc[0]) < rh + bh
+                        and abs(bpos[1] - rc[1]) < rh + bh
+                        and (bpos[2] - bh) > (rc[2] + rh)):
+                    self._stats.fly_over = True
+                    break
 
         # 3. Blue dropped (fell off table or below threshold).
         blue_z = d.xpos[self._blue_body_id][2]
@@ -495,6 +589,15 @@ class SafeCubeEnv:
         if self._grasp_site_id < 0:
             return self.ee_position()
         return self.data.site_xpos[self._grasp_site_id].copy()
+
+    def blue_cube_position(self) -> np.ndarray:
+        """World position of the blue cube's center. During carry this differs
+        from grasp_position() by the grip-hold offset (see _grip_hold_offset).
+        Falls back to grasp_position() if the body id is not set."""
+        assert self.data is not None
+        if self._blue_body_id < 0:
+            return self.grasp_position()
+        return self.data.xpos[self._blue_body_id].copy()
 
     def gripper_qpos(self) -> float:
         """Current gripper joint position. Low = closed, high = open."""

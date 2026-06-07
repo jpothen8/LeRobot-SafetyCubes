@@ -34,7 +34,7 @@ class SceneConfig:
     mjcf_path: str = "sim/assets/so101/so101_new_calib.urdf"
 
     # ── Cube sizes (1-inch cubes, per spec) ──────────────────────────────
-    n_red_cubes: int = 10
+    n_red_cubes: int = 8
     red_cube_half: float = _CUBE_SIDE / 2     # ≈ 0.0127 m
     blue_cube_half: float = _CUBE_SIDE / 2
 
@@ -42,8 +42,18 @@ class SceneConfig:
     # Centered in front of the arm, within easy reach of the SO-101 workspace.
     red_field_center: tuple[float, float] = (0.225, 0.0)
     red_field_size: float = _FIELD_SIDE
-    # Minimum center-to-center separation between any two red cubes.
-    min_cube_separation: float = 0.055
+    # Minimum center-to-center separation between any two red cubes — the
+    # *placement-diversity* knob, but COUPLED to path_clearance_radius: to weave
+    # *between* two cubes (not route around the field) the planner needs clearance
+    # on both sides, so clearance must be ≤ sep/2. 8 cubes at 0.11/0.055 weave but
+    # pack into predictable "hubs" (peak/mean 6.3). Shrinking to 0.08/0.04 keeps
+    # weaving (clearance=sep/2 → 0% route-around) and scatters the field (spread
+    # 4.0), BUT the finger clip rate climbs hard as clearance tightens: measured
+    # 20%→30%→37%→42% at sep/clearance 0.11/0.055 → 0.10/0.05 → 0.09/0.045 →
+    # 0.08/0.04. So 0.04 is NOT free; it costs ~42% discarded episodes. (Fewer
+    # cubes at the safe 0.11/0.055 is the cheaper variety lever: 6 cubes → spread
+    # 3.7, 100% weave, 0% around, only ~7% clips.)
+    min_cube_separation: float = 0.09
     # Larger safety margin specifically around the blue cube and goal — they
     # need clear approach/release space, so red cubes stay farther away from
     # them than from each other. The blue margin is sized for the deep side
@@ -52,11 +62,16 @@ class SceneConfig:
     blue_safety_radius: float = 0.115
     goal_safety_radius: float = 0.07
 
-    # ── Blue cube spawn region (LEFT side of arm, outside red field) ─────
-    # Sits clearly outside the red field's +y edge (~+0.10), with x shifted
-    # 1" closer to the arm to match the field.
-    blue_x_range: tuple[float, float] = (0.195, 0.255)
-    blue_y_range: tuple[float, float] = (0.17, 0.21)
+    # ── Blue cube spawn (FIXED position, LEFT side of arm) ───────────────
+    # Fixed (not randomized): the cube starts at the same spot every episode so
+    # the pick is repeatable. The env then YAWS it at reset so its vertical
+    # faces meet the descending gripper jaws square-on (see
+    # SafeCubeEnv._blue_grasp_yaw / _set_blue_spawn_pose). Sits clearly outside
+    # the red field's +y edge (~+0.15). Kept as (degenerate) ranges so the
+    # layout sampler and path-bounds code are untouched — both endpoints equal,
+    # so rng.uniform just returns the fixed value.
+    blue_x_range: tuple[float, float] = (0.21, 0.24)
+    blue_y_range: tuple[float, float] = (0.175, 0.205)
 
     # ── Goal patch (FIXED, RIGHT side of arm) ────────────────────────────
     # Sits clearly outside the red field's -y edge (~-0.15), x matches field.
@@ -67,8 +82,14 @@ class SceneConfig:
     goal_size: float = 3.0 * _INCH    # 3 inch interior side ≈ 0.0762 m
 
     # ── Path-connectivity check ──────────────────────────────────────────
-    # Clearance (m) the ee + held blue cube needs from any red cube center
-    # for a candidate layout to be considered "workable."
+    # Clearance (m) the planned corridor keeps from every red cube center. Set to
+    # sep/2 so the path threads *between* adjacent cubes (clearance > sep/2 makes
+    # the BFS route around the whole field — see min_cube_separation). This is also
+    # the expert's tracking-margin budget against finger clips: empirically the
+    # clip rate is ~2*clearance-sensitive — 0.055→20%, 0.05→30%, 0.045→37%,
+    # 0.04→42%. 0.04 (paired with sep 0.08) weaves with max layout variety but
+    # discards ~42% of episodes to clips; it is an experimental setting, not a free
+    # lunch. Do NOT raise above sep/2 without accepting route-around.
     path_clearance_radius: float = 0.045
     # Grid resolution for the BFS in sample_layout.
     path_grid_res: float = 0.005
@@ -79,10 +100,10 @@ class SceneConfig:
     table_z: float = 0.0
     # Stay-low enforcement: ee z must stay below this once the cube is
     # grasped. Set tight enough that "lifting up and over the cubes" fires a
-    # ceiling violation — red cube tops are at ~25 mm, so anything above
-    # ~60 mm means the arm is going *over* the obstacles instead of
-    # weaving between them.
-    ee_height_ceiling: float = 0.060
+    # ceiling violation — red cube tops are at ~25 mm and clearing one needs the
+    # held cube center ≥ ~38 mm, so a 35 mm limit makes going *over* an obstacle
+    # a violation and forces weaving *between* them.
+    ee_height_ceiling: float = 0.035
 
     # ── Camera + rendering (camera BEHIND arm, looking forward) ──────────
     camera_name: str = "agentview"
@@ -193,7 +214,7 @@ class ExpertConfig:
     # 1-inch cube) — a realistic side grasp rather than perching on the cube
     # top. The grasp site sits ~4-5 mm above the fingertips at the grasp pose,
     # so 0.0110 → fingertips ≈ 0.0064 m (= 0.25 × the 1-inch cube).
-    descend_grasp_z: float = 0.0110
+    descend_grasp_z: float = 0.01
     descend_reach_tol: float = 0.005    # settle close to the calibrated depth
 
     # CLOSE phase advances only once the gripper qpos drops below this
@@ -201,7 +222,7 @@ class ExpertConfig:
     grasp_close_qpos_threshold: float = 0.25
     # DESCEND2 (final hover over goal) target tolerance — tighter than the
     # generic 2 cm so the drop lands close to the goal patch center.
-    descend2_reach_tol: float = 0.012
+    descend2_reach_tol: float = 0.0075
     # OPEN phase advances only once the gripper qpos has risen above this
     # (jaws actually open enough to release the cube). Kept ≥ the env's grip
     # release threshold (0.55) so the cube is physically released *before* OPEN
@@ -209,12 +230,14 @@ class ExpertConfig:
     grasp_open_qpos_threshold: float = 0.55
 
     # ABSOLUTE cube-center z during LIFT/CARRY. Every phase steers the grasp
-    # site (= held cube), so this is the cube height directly. The cube weaves
-    # the cleared corridor *between* the obstacles in XY; the height is set just
-    # high enough that the side-grasping gripper's body clears the ~25 mm red
-    # tops (lower and a finger dips into a neighbour). The ee_site stays well
-    # below ee_height_ceiling (0.060) at this carry height.
-    carry_z: float = 0.042
+    # site (= held cube), so this is the cube height directly. 30 mm is the
+    # tested low-weave sweet spot: low enough that the cube bottom (~17 mm) stays
+    # under the 25 mm red tops, so it physically cannot pass over a red and must
+    # weave *between* them in XY; high enough that the bulky side-grasp gripper
+    # (which reaches ~25 mm below the cube) clears the table. Stays under
+    # ee_height_ceiling (0.035). The wide gripper needs roomy corridors — see
+    # path_clearance_radius (0.075).
+    carry_z: float = 0.025
     # ABSOLUTE cube-center z at release: DESCEND2 steers the grasp site (= cube)
     # down to the goal at this height for a gentle drop into the goal square.
     pre_release_z: float = 0.022
