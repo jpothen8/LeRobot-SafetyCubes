@@ -65,7 +65,7 @@ def _collect_block(payload: dict) -> dict:
     from sim.configs import EnvConfig, ExpertConfig, SceneConfig
     from sim.dagger import PolicyRollout
     from sim.env import SafeCubeEnv
-    from sim.expert import ScriptedExpert
+    from sim.expert import ScriptedExpert, _Phase
     from sim.recorder import EpisodeRecorder
     from sim.rollout import run_expert_episode
 
@@ -77,7 +77,8 @@ def _collect_block(payload: dict) -> dict:
 
     scene = SceneConfig(n_red_cubes=payload["n_red"])
     env = SafeCubeEnv(EnvConfig(scene=scene, max_episode_steps=payload["max_steps"],
-                                seed=base_seed + ep_start))
+                                seed=base_seed + ep_start,
+                                terminate_on_red_contact=False))
     obs, _ = env.reset(seed=base_seed + ep_start)
     state_dim = obs["state"].shape[0]
 
@@ -86,6 +87,7 @@ def _collect_block(payload: dict) -> dict:
         image_size=scene.image_size, action_dim=env.action_dim, state_dim=state_dim,
         fps=env.cfg.fps, use_videos=True,
         camera_encoder=VideoEncoderConfig(vcodec=payload["vcodec"]),
+        track_actor=True,
     )
     expert = ScriptedExpert(env=env, cfg=ExpertConfig())
     grip_open = ExpertConfig().grip_open
@@ -102,18 +104,49 @@ def _collect_block(payload: dict) -> dict:
 
     # Per-worker RNG for the expert/policy mixing coin flips (disjoint, deterministic).
     rng = np.random.default_rng(base_seed + ep_start)
+    switch_interval = payload["switch_interval"]
+
+    # Chunk-based mixing state (reset per episode in the loop below).
+    _chunk_actor: list[str] = ["expert"]
+    _chunk_remaining: list[int] = [0]
+
+    def _reset_chunk_state() -> None:
+        _chunk_actor[0] = "expert"
+        _chunk_remaining[0] = 0
 
     def choose_executed(expert_action, obs, info):
-        # DAgger: execute the expert w.p. alpha, else the policy rolled the SAME
-        # (queued) way it is deployed, so we visit the deployment distribution.
-        # The label recorded by run_expert_episode is always the expert action.
-        if rng.random() < alpha:
-            return expert_action
-        return policy.act_queued(obs, task)
+        # Expert always controls pickup (APPROACH→DESCEND→CLOSE→LIFT) and
+        # dropoff (DESCEND2→OPEN). Mixed actor only during CARRY.
+        if expert._phase is not _Phase.CARRY:
+            _reset_chunk_state()  # ensure fresh chunk draw when CARRY begins
+            return expert_action, 0.0
+        # Chunk-based mixing during carry: pick actor for switch_interval steps
+        # at a time so transitions are smooth, not jittery every-step flips.
+        if _chunk_remaining[0] <= 0:
+            prev_actor = _chunk_actor[0]
+            _chunk_actor[0] = "expert" if rng.random() < alpha else "policy"
+            _chunk_remaining[0] = switch_interval
+            if _chunk_actor[0] == "policy":
+                # Flush the stale action queue so the policy re-infers from the
+                # current observation rather than replaying actions planned at the
+                # last handoff (which causes the arm to backtrack to a past state).
+                policy.reset()
+            elif prev_actor == "policy":
+                # Expert resuming after a policy chunk: the policy may have carried
+                # the cube forward past several BFS waypoints while _wp_idx was
+                # frozen. Snap _wp_idx forward so the expert targets the next
+                # waypoint *ahead* of the cube rather than one it has already passed
+                # (which would drive the arm backward).
+                expert.sync_wp_to_cube()
+        _chunk_remaining[0] -= 1
+        if _chunk_actor[0] == "expert":
+            return expert_action, 0.0
+        return policy.act_queued(obs, task), 1.0
 
     saved = discarded = success = red_contact = flyover = lfail = 0
     for ep in range(ep_start, ep_end):
         policy.reset()  # reset the action queue once per episode (queued rollout)
+        _reset_chunk_state()  # fresh actor assignment at episode start
         try:
             stats = run_expert_episode(
                 env=env, expert=expert, rec=rec, task=task,
@@ -164,6 +197,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-steps", type=int, default=500)
     p.add_argument("--successes-only", action="store_true",
                    help="discard failed episodes (off by default: DAgger wants the failures)")
+    p.add_argument("--switch-interval", type=int, default=10,
+                   help="number of steps each actor (expert or policy) holds before re-sampling; "
+                        "1 = original per-step mixing (jittery), 10+ = chunk-level switching")
     p.add_argument("--n-workers", type=int, default=4,
                    help="parallel workers; EACH holds a ~18 GB π0 copy → 4 comfortably safe on the "
                         "96 GB box (~72 GB + overhead), 5+ crowds the 75–85 GB target")
@@ -203,6 +239,7 @@ def main() -> None:
             dataset_root=args.dataset_root, alpha=args.alpha, task=TASK_DESCRIPTION,
             n_red=args.n_red_cubes, max_steps=args.max_steps,
             successes_only=args.successes_only, vcodec=args.vcodec,
+            switch_interval=args.switch_interval,
         ))
 
     # Fresh shard dirs.
