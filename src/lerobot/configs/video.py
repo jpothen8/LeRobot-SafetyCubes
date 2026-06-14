@@ -88,6 +88,13 @@ class VideoEncoderConfig:
 
     def __post_init__(self) -> None:
         self.resolve_vcodec()
+        # NVENC rejects GOP < 4 (avcodec_open2 -> EINVAL); LeRobot's default g=2
+        # silently breaks hardware H.264/HEVC encode. Clamp to the minimum NVENC
+        # accepts — small enough to keep keyframes frequent for fast random-frame
+        # decode. (Type-only validation doesn't catch this; it fails at open.)
+        if self.vcodec in ("h264_nvenc", "hevc_nvenc") and self.g is not None and self.g < 4:
+            logger.warning(f"GOP size g={self.g} too small for {self.vcodec}; clamping to 4.")
+            self.g = 4
         # Empty-constructor ergonomics: ``VideoEncoderConfig()`` must "just work".
         if self.preset is None and self.vcodec == "libsvtav1":
             self.preset = LIBSVTAV1_DEFAULT_PRESET
@@ -208,9 +215,15 @@ class VideoEncoderConfig:
             set_if("threads", encoder_threads)
         elif self.vcodec in ("h264_videotoolbox", "hevc_videotoolbox"):
             if self.crf is not None:
-                opts["q:v"] = max(1, min(100, 100 - self.crf * 2))
+                # Route through set_if so as_strings is honored (PyAV add_stream
+                # options must be str; a raw int here raises "expected str, got int").
+                set_if("q:v", max(1, min(100, 100 - self.crf * 2)))
         elif self.vcodec in ("h264_nvenc", "hevc_nvenc"):
-            opts["rc"] = 0
+            # set_if (not a raw `opts["rc"] = 0`) so as_strings=True stringifies
+            # it to "0" — PyAV's add_stream rejects int option values, while the
+            # string "0" passes both LeRobot's numeric validator and ffmpeg's
+            # nvenc AVOption parser. rc=0 → constqp mode.
+            set_if("rc", 0)
             set_if("qp", self.crf)
             set_if("preset", self.preset)
         elif self.vcodec == "h264_vaapi":

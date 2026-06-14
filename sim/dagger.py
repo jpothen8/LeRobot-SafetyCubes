@@ -27,6 +27,7 @@ import sim.safe_pi0_policy  # noqa: F401  -- registers `safe_pi0` with draccus
 from sim.env import SafeCubeEnv
 from sim.expert import ScriptedExpert
 from sim.recorder import EpisodeRecorder
+from sim.rollout import run_expert_episode
 
 
 @dataclass
@@ -53,7 +54,8 @@ class PolicyRollout:
             feature shapes and normalization stats. Use the same dataset the
             policy was trained on.
         device: torch device string; defaults to the policy config's device.
-        image_key: dataset image feature key.
+        image_key: main (agentview) dataset image feature key.
+        wrist_image_key: wrist-cam dataset image feature key.
     """
 
     def __init__(
@@ -64,6 +66,7 @@ class PolicyRollout:
         dataset_root: str | None = None,
         device: str | None = None,
         image_key: str = "observation.images.agentview",
+        wrist_image_key: str = "observation.images.wrist",
     ) -> None:
         from lerobot.configs import PreTrainedConfig
         from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
@@ -82,19 +85,27 @@ class PolicyRollout:
         self.policy.eval()
         self.device = cfg.device
         self.image_key = image_key
+        self.wrist_image_key = wrist_image_key
 
     def reset(self) -> None:
         self.policy.reset()
 
     def _format(self, obs: dict, task: str) -> dict:
-        img = torch.from_numpy(np.ascontiguousarray(obs["image"]))  # (H, W, 3) uint8
-        img = img.permute(2, 0, 1).unsqueeze(0).float() / 255.0     # (1, 3, H, W) in [0, 1]
+        def to_chw(arr) -> torch.Tensor:
+            t = torch.from_numpy(np.ascontiguousarray(arr))         # (H, W, 3) uint8
+            return t.permute(2, 0, 1).unsqueeze(0).float() / 255.0  # (1, 3, H, W) in [0, 1]
+
         state = torch.from_numpy(np.asarray(obs["state"], dtype=np.float32)).unsqueeze(0)
-        return {
-            self.image_key: img.to(self.device),
+        batch = {
+            self.image_key: to_chw(obs["image"]).to(self.device),
             "observation.state": state.to(self.device),
             "task": [task],
         }
+        # Wrist cam is a second policy camera; harmless if the loaded policy was
+        # trained single-cam (_preprocess_images only reads its config's keys).
+        if "wrist_image" in obs:
+            batch[self.wrist_image_key] = to_chw(obs["wrist_image"]).to(self.device)
+        return batch
 
     def act(self, obs: dict, task: str) -> np.ndarray:
         """Return a single raw-joint action ``(action_dim,)`` for ``obs``.
@@ -107,6 +118,19 @@ class PolicyRollout:
         with torch.inference_mode():
             action = self.policy.select_action(batch)   # (1, action_dim), normalized
         action = self.postprocessor(action)              # un-normalized raw joints
+        return action.squeeze(0).to("cpu").numpy()
+
+    def act_queued(self, obs: dict, task: str) -> np.ndarray:
+        """Like :meth:`act` but WITHOUT the per-step queue reset, so
+        ``select_action`` executes the predicted action chunk before re-planning
+        — the exact closed-loop path used at deployment/eval. Call
+        :meth:`reset` once per episode. Use this to *generate* DAgger rollout
+        states so they match the deployment distribution.
+        """
+        batch = self.preprocessor(self._format(obs, task))
+        with torch.inference_mode():
+            action = self.policy.select_action(batch)
+        action = self.postprocessor(action)
         return action.squeeze(0).to("cpu").numpy()
 
 
@@ -141,38 +165,33 @@ def collect_dagger_round(
     stats = RoundStats(alpha=alpha)
     pure_expert = policy is None or alpha >= 1.0
 
+    _prev_was_policy: list[bool] = [False]
+
+    def choose_executed(
+        expert_action: np.ndarray, obs: dict, info: dict
+    ) -> tuple[np.ndarray, float]:
+        use_expert = rng.random() < alpha
+        if use_expert:
+            if _prev_was_policy[0]:
+                # Snap _wp_idx past waypoints the policy already carried the cube
+                # through, otherwise the expert targets stale behind-cube waypoints
+                # and drives the arm backward on the handoff.
+                expert.sync_wp_to_cube()
+            _prev_was_policy[0] = False
+            return expert_action, 0.0
+        _prev_was_policy[0] = True
+        return policy.act_queued(obs, task), 1.0
+
     for ep in range(n_episodes):
-        obs, info = env.reset(seed=base_seed + ep)
-        expert.reset()
         if policy is not None:
-            policy.reset()
-        rec.begin_episode(task=task)
-
-        terminated = truncated = False
-        settle_budget = max(int(env.cfg.fps), env.cfg.success_dwell_steps + 5)
-        settle_left = settle_budget
-        while not (terminated or truncated):
-            if expert.done():
-                if settle_left <= 0:
-                    break
-                settle_left -= 1
-                # Hold pose, gripper open, so the dwell window can register and
-                # the released cube is not re-grabbed by the magnetic grip.
-                expert_action = np.concatenate([env.joint_positions(), [grip_open]])
-            else:
-                expert_action = expert.act(info)
-
-            if pure_expert:
-                executed = expert_action
-            else:
-                use_expert = rng.random() < alpha
-                executed = expert_action if use_expert else policy.act(obs, task)
-
-            # DAgger: record the expert label at the visited state.
-            rec.add(obs, expert_action, info)
-            obs, _, terminated, truncated, info = env.step(executed)
-
-        s = info["stats"]
+            policy.reset()  # reset the action queue once per episode (queued rollout)
+        _prev_was_policy[0] = False  # reset transition tracker per episode
+        # SAME expert path as sim.scripts.collect_demos -> identical labels.
+        s = run_expert_episode(
+            env=env, expert=expert, rec=rec, task=task,
+            seed=base_seed + ep, grip_open=grip_open,
+            choose_executed=None if pure_expert else choose_executed,
+        )
         stats.episodes += 1
         stats.successes += int(s["success"])
         stats.red_contacts += int(s["red_contact"])

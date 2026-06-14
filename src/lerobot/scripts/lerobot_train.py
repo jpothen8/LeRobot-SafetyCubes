@@ -19,7 +19,9 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 """
 
 import dataclasses
+import json
 import logging
+import shutil
 import time
 from contextlib import nullcontext
 from pprint import pformat
@@ -520,6 +522,19 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 update_last_checkpoint(checkpoint_dir)
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
+                # Save a metrics snapshot so stats survive checkpoint rotation.
+                metrics_snapshot = {"step": step}
+                try:
+                    metrics_snapshot.update(train_tracker.to_dict())
+                except Exception:
+                    pass
+                with open(checkpoint_dir / "metrics.json", "w") as _f:
+                    json.dump(metrics_snapshot, _f, indent=2)
+                # Delete all previous step checkpoint dirs; keep only the latest.
+                for _old in checkpoint_dir.parent.iterdir():
+                    if _old.is_dir() and not _old.is_symlink() and _old.resolve() != checkpoint_dir.resolve():
+                        shutil.rmtree(_old)
+                        logging.info(f"Deleted old checkpoint: {_old.name}")
 
             accelerator.wait_for_everyone()
 

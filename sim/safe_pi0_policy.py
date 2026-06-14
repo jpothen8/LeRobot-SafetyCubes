@@ -86,7 +86,7 @@ from lerobot.utils.constants import (
     OBS_LANGUAGE_TOKENS,
 )
 
-from sim.safety_geometry import FKChain, safety_loss, sdf_clearance
+from sim.safety_geometry import FKChain, height_ceiling_loss, safety_loss, sdf_clearance
 
 # Privileged batch keys written by sim.recorder.EpisodeRecorder. The policy
 # never feeds these to the network; only the safety loss reads them, and they
@@ -94,6 +94,7 @@ from sim.safety_geometry import FKChain, safety_loss, sdf_clearance
 PRIV_CUBE_POSITIONS = "privileged.cube_positions"
 PRIV_CUBE_HALF_EXTENTS = "privileged.cube_half_extents"
 PRIV_EE_POS = "privileged.ee_pos"
+PRIV_GRASPED = "privileged.grasped"
 
 
 # ----------------------------------------------------------------------------
@@ -117,6 +118,24 @@ class SafePI0Config(PI0Config):
     # Weight the safety term by (1 - t) so unreliable high-t endpoint estimates
     # count less. Set False to weight all flow-times equally.
     safety_time_weighting: bool = True
+
+    # Obstacle avoidance geometry. With lateral_clearance=True the obstacle SDF
+    # is measured in XY only (cubes as infinite vertical prisms), so lifting the
+    # ee *over* a red cube no longer counts as avoidance — the policy must weave
+    # *around* in the plane. Height is constrained separately by the ceiling term.
+    lateral_clearance: bool = True
+
+    # Stay-low ("don't fly over the obstacles") penalty. A smooth, differentiable
+    # term that spikes when the predicted ee height exceeds `ee_height_ceiling`.
+    # Mirrors the env's SceneConfig.ee_height_ceiling stay-low rule and, like the
+    # env, is gated to the carry phase (privileged.grasped) so the initial
+    # reach-down from the home pose (ee starts ~85 mm up) isn't penalised.
+    ee_height_ceiling: float = 0.035      # m — keep in sync with SceneConfig
+    # softplus sharpness (1/m). ~250 puts the knee a few mm wide: ≈0 at the
+    # expert carry height (~23 mm cube center) and a sharp spike past the 35 mm ceiling.
+    ceiling_alpha: float = 250.0
+    ceiling_weight: float = 4.0           # weight of the height term within L_safety
+    ceiling_grasped_only: bool = True     # only penalise height during carry (grasped)
 
     # Forward-kinematics source. Must match the arm the dataset was recorded on.
     urdf_path: str = "sim/assets/so101/so101_new_calib.urdf"
@@ -258,10 +277,40 @@ class SafePI0Policy(PI0Policy):
         centers = cube_pos.reshape(b, -1, 3)
         halves = cube_half.reshape(b, -1, 3)
 
-        clearance = sdf_clearance(ee_traj, centers, halves, self.config.ee_radius)  # (B, T)
+        clearance = sdf_clearance(
+            ee_traj, centers, halves, self.config.ee_radius, lateral=self.config.lateral_clearance
+        )  # (B, T)
         weight = (1.0 - time).clamp(0.0, 1.0) if self.config.safety_time_weighting else None
         return safety_loss(
             clearance, alpha=self.config.sdf_alpha, margin=self.config.sdf_margin, weight=weight
+        )
+
+    def _ceiling_loss(self, ee_traj: Tensor, batch: dict[str, Tensor], time: Tensor) -> Tensor:
+        """Smooth, grasp-gated penalty for the ee rising above the height ceiling.
+
+        Weighted by ``(1 - t)`` (down-weight noisy high-t endpoint estimates) and,
+        when ``ceiling_grasped_only``, by ``privileged.grasped`` so only carry-phase
+        frames are penalised — matching the env, which enforces the ceiling only
+        once the blue cube is grasped.
+        """
+        cfg = self.config
+        ee_z = ee_traj[..., 2]                                        # (B, T)
+        b = ee_z.shape[0]
+        if cfg.safety_time_weighting:
+            weight = (1.0 - time).clamp(0.0, 1.0).to(ee_z.device)     # (B,)
+        else:
+            weight = torch.ones(b, device=ee_z.device, dtype=ee_z.dtype)
+        if cfg.ceiling_grasped_only:
+            grasped = batch.get(PRIV_GRASPED)
+            if grasped is not None:
+                weight = weight * grasped.to(ee_z.device, ee_z.dtype).reshape(b)
+            else:
+                logging.warning(
+                    "SafePI0Policy: ceiling_grasped_only=True but '%s' is missing from the batch; "
+                    "applying the height-ceiling penalty to all frames.", PRIV_GRASPED
+                )
+        return height_ceiling_loss(
+            ee_z, cfg.ee_height_ceiling, alpha=cfg.ceiling_alpha, weight=weight
         )
 
     # ----- training forward --------------------------------------------------
@@ -291,7 +340,9 @@ class SafePI0Policy(PI0Policy):
         # --- safety term: endpoint estimate -> FK -> SDF -> -log p_safe ---
         a_hat = (x_t - t * v)[:, :, :action_dim]     # clean-action estimate (normalized)
         ee_traj = self._fk_chunk(a_hat)              # (B, chunk, 3) world frame
-        l_safety = self._safety_loss(ee_traj, batch, time)
+        l_obstacle = self._safety_loss(ee_traj, batch, time)      # XY (lateral) cube avoidance
+        l_ceiling = self._ceiling_loss(ee_traj, batch, time)      # stay-low / anti fly-over
+        l_safety = l_obstacle + self.config.ceiling_weight * l_ceiling
 
         loss = l_flow + self.config.safety_weight * l_safety
 
@@ -299,6 +350,8 @@ class SafePI0Policy(PI0Policy):
             "loss": loss.item(),
             "l_flow": l_flow.item(),
             "l_safety": l_safety.item(),
+            "l_obstacle": l_obstacle.item(),
+            "l_ceiling": l_ceiling.item(),
             "loss_per_dim": flow_losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
         }
 

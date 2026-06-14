@@ -6,10 +6,11 @@ against hand-placed cubes and a known arm config (``project_summary.md`` §8
 these.
 
 Contents:
-    box_sdf        signed distance, points → axis-aligned boxes
-    sdf_clearance  min box SDF minus the ee bounding-sphere radius
-    safety_loss    -log σ(α·(clearance − margin)), optionally (1−t)-weighted
-    FKChain        differentiable forward kinematics via pytorch_kinematics
+    box_sdf            signed distance, points → axis-aligned boxes (3D or XY-only)
+    sdf_clearance      min box SDF minus the ee bounding-sphere radius
+    safety_loss        -log σ(α·(clearance − margin)), optionally (1−t)-weighted
+    height_ceiling_loss smooth one-sided penalty that spikes when ee z exceeds a ceiling
+    FKChain            differentiable forward kinematics via pytorch_kinematics
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ import torch.nn.functional as F  # noqa: N812
 from torch import Tensor
 
 
-def box_sdf(points: Tensor, centers: Tensor, halves: Tensor) -> Tensor:
+def box_sdf(points: Tensor, centers: Tensor, halves: Tensor, lateral: bool = False) -> Tensor:
     """Signed distance from points to axis-aligned boxes.
 
     Positive outside (safe), negative inside (penetration). The classic
@@ -31,6 +32,11 @@ def box_sdf(points: Tensor, centers: Tensor, halves: Tensor) -> Tensor:
         points:  ``(B, P, 3)`` query points (e.g. ee positions along a chunk).
         centers: ``(B, M, 3)`` box centers (red-cube world positions).
         halves:  ``(B, M, 3)`` box half-extents.
+        lateral: if True, measure distance in the XY plane only — i.e. treat each
+            cube as an *infinite vertical prism*. Then lifting the ee straight up
+            over a cube no longer increases clearance, so "fly over the top" stops
+            counting as obstacle avoidance and the only way out is to go *around*
+            in XY. Height is instead constrained by :func:`height_ceiling_loss`.
 
     Returns:
         ``(B, P, M)`` signed distance of every point to every box.
@@ -39,20 +45,25 @@ def box_sdf(points: Tensor, centers: Tensor, halves: Tensor) -> Tensor:
     c = centers.unsqueeze(1)       # (B, 1, M, 3)
     h = halves.unsqueeze(1)        # (B, 1, M, 3)
     d = (p - c).abs() - h          # (B, P, M, 3)
+    if lateral:
+        d = d[..., :2]             # X, Y only → infinite vertical prism
     outside = torch.linalg.vector_norm(torch.clamp(d, min=0.0), dim=-1)  # (B, P, M)
     inside = torch.clamp(d.amax(dim=-1), max=0.0)                        # (B, P, M)
     return outside + inside
 
 
-def sdf_clearance(points: Tensor, centers: Tensor, halves: Tensor, ee_radius: float) -> Tensor:
+def sdf_clearance(
+    points: Tensor, centers: Tensor, halves: Tensor, ee_radius: float, lateral: bool = False
+) -> Tensor:
     """Min over boxes of the box SDF, minus the ee bounding-sphere radius.
 
     Returns ``(B, P)`` signed clearance; < 0 means the gripper sphere overlaps a
     cube. The held blue cube is absorbed into ``ee_radius`` (``project_summary``
-    §4), so it is not treated as an obstacle.
+    §4), so it is not treated as an obstacle. ``lateral`` is forwarded to
+    :func:`box_sdf` (XY-only avoidance).
     """
-    sdf = box_sdf(points, centers, halves)        # (B, P, M)
-    return sdf.amin(dim=-1) - ee_radius           # (B, P)
+    sdf = box_sdf(points, centers, halves, lateral=lateral)   # (B, P, M)
+    return sdf.amin(dim=-1) - ee_radius                       # (B, P)
 
 
 def safety_loss(
@@ -80,6 +91,41 @@ def safety_loss(
     z = alpha * (clearance - margin)              # (B, P)
     per_point = F.softplus(-z)                    # (B, P)  == -log σ(z)
     per_sample = per_point.mean(dim=1)            # (B,)
+    if weight is None:
+        return per_sample.mean()
+    weight = weight.to(per_sample.dtype)
+    return (weight * per_sample).sum() / (weight.sum() + 1e-8)
+
+
+def height_ceiling_loss(
+    ee_z: Tensor,
+    ceiling: float,
+    *,
+    alpha: float,
+    weight: Tensor | None = None,
+) -> Tensor:
+    """Smooth one-sided penalty that spikes when ee height exceeds ``ceiling``.
+
+    ``softplus(α·(ee_z − ceiling))``: ≈ 0 well below the ceiling, then rises
+    sharply (≈ linearly with slope α) above it. Fully differentiable, so it can
+    be added straight into the flow-matching loss. Mirrors the env's
+    ``SceneConfig.ee_height_ceiling`` stay-low rule (red-cube tops sit at ~25 mm;
+    going above ~60 mm means the arm is lifting *over* the obstacles instead of
+    weaving between them). Larger ``alpha`` ⇒ a sharper spike at the threshold.
+
+    Args:
+        ee_z:    ``(B, T)`` end-effector height along the predicted chunk.
+        ceiling: height (m) above which the penalty turns on.
+        alpha:   spike sharpness (1/m).
+        weight:  optional ``(B,)`` per-sample weight (e.g. ``(1 − t)`` times a
+            grasp/carry-phase gate). When given, returns a weighted mean over the
+            batch; else a plain mean. A zero-weight batch returns ~0 safely.
+
+    Returns:
+        Scalar loss.
+    """
+    per_point = F.softplus(alpha * (ee_z - ceiling))   # (B, T)
+    per_sample = per_point.mean(dim=1)                 # (B,)
     if weight is None:
         return per_sample.mean()
     weight = weight.to(per_sample.dtype)

@@ -81,7 +81,8 @@ def to_absolute_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) ->
     return actions
 
 
-@ProcessorStepRegistry.register("delta_actions_processor")
+@ProcessorStepRegistry.register("delta_actions_processor")     # canonical name → sets _registry_name
+@ProcessorStepRegistry.register("relative_actions_processor")  # legacy alias used by lerobot/pi0_base
 @dataclass
 class RelativeActionsProcessorStep(ProcessorStep):
     """Converts absolute actions to relative actions (action -= state) for masked dimensions.

@@ -34,6 +34,7 @@ import numpy as np
 
 from .configs import ExpertConfig
 from .env import SafeCubeEnv
+from .scene import plan_carry_path
 
 
 class _Phase(Enum):
@@ -66,6 +67,68 @@ class ScriptedExpert:
         self._wp_idx = 0
         self._jaws_closed_at = -1
 
+    def sync_wp_to_cube(self) -> None:
+        """Advance _wp_idx past waypoints the cube has already moved beyond.
+
+        Call this when the expert resumes CARRY after a policy chunk. While the
+        policy controlled the arm, _wp_idx was frozen; if the policy carried the
+        cube forward past several BFS waypoints the expert will otherwise target
+        stale (behind-the-cube) waypoints and drive the arm backward.
+
+        The heuristic: a waypoint is "passed" if it is farther from the goal than
+        the cube currently is (plus a small tolerance to avoid skipping ahead of
+        the cube on noise). We only advance, never retreat.
+        """
+        if self._phase is not _Phase.CARRY:
+            return
+        wps = self.env.layout.carry_waypoints if self.env.layout else []
+        if not wps:
+            return
+        goal_xy = self.env.layout.goal_xy
+        cube_xy = self.env.blue_cube_position()[:2]
+        dist_cube_goal = float(np.linalg.norm(cube_xy - goal_xy))
+        while (self._wp_idx < len(wps) - 1 and
+               np.linalg.norm(wps[self._wp_idx] - goal_xy) > dist_cube_goal + 0.02):
+            self._wp_idx += 1
+
+    def _maybe_replan_carry(self, cube_xy: np.ndarray, reds: np.ndarray) -> None:
+        """Re-route the carry corridor if the held cube has drifted off it.
+
+        ``sync_wp_to_cube`` only fixes *along-path* progress (the waypoint
+        index); it cannot help when the policy has pushed the cube *laterally*
+        off the corridor, where the original spawn→goal waypoints no longer
+        describe a safe route from the cube's position (following them can drive
+        the arm back across the field or straight through a red).
+
+        When the cube ("the arm's state", measured at the cube center the
+        corridor is cleared for) is farther than ``replan_offpath_threshold``
+        from the CLOSEST current waypoint, re-run the BFS planner from the cube's
+        CURRENT XY to the goal and adopt that fresh corridor (``_wp_idx`` reset
+        to 0). Uses the live red positions so the route respects any cubes the
+        rollout has nudged. No-op when disabled, before any path exists, when the
+        cube is still on-corridor, or when no clearance-respecting path exists
+        from here (keep the old path rather than steer through an obstacle).
+
+        Fires only in DAgger: the pure expert tracks waypoints within
+        ``waypoint_reach_tol`` (≪ threshold), so the closest waypoint is always
+        near and this never triggers during demonstration collection.
+        """
+        thr = self.cfg.replan_offpath_threshold
+        if thr <= 0 or self.env.layout is None:
+            return
+        wps = self.env.layout.carry_waypoints
+        if not wps:
+            return
+        closest = float(np.linalg.norm(np.asarray(wps) - cube_xy, axis=1).min())
+        if closest <= thr:
+            return
+        new_path = plan_carry_path(
+            self.env.cfg.scene, reds, cube_xy, self.env.layout.goal_xy,
+        )
+        if new_path:
+            self.env.layout.carry_waypoints = new_path
+            self._wp_idx = 0
+
     # ----- public --------------------------------------------------------
 
     def act(self, privileged: dict) -> np.ndarray:
@@ -73,10 +136,26 @@ class ScriptedExpert:
         blue = np.asarray(privileged["blue_cube_pos"], dtype=np.float64)
         goal = np.asarray(privileged["goal_pos"], dtype=np.float64)
         reds = np.asarray(privileged["cube_positions"], dtype=np.float64)
-        ee = self.env.ee_position()
 
-        target, self._grip, advance = self._target_for_phase(ee, blue, goal, reds)
-        joint_cmd = self._ik_step(target)
+        # Grasp-state resync. If the cube is already in hand but the FSM is still
+        # in a pre-grasp phase, the policy grasped it (DAgger mixing) before the
+        # expert's own phase logic advanced. Left alone, APPROACH keeps steering
+        # toward a point ABOVE the cube (pre_grasp_height), lifting the *held*
+        # cube over the ceiling. Snap to LIFT so we instead carry it DOWN to
+        # carry_z. In normal expert-driven rollouts `grasped` only turns True
+        # during CLOSE, so this never fires there -> no change to demo behavior.
+        if self._phase in (_Phase.APPROACH, _Phase.DESCEND) and self.env._blue_grasped():
+            self._phase = _Phase.LIFT
+            self._phase_step = 0
+            self._wp_idx = 0
+            self._jaws_closed_at = -1
+        # ref is the grasp site (jaw-gap center). Pre-grasp phases target it
+        # directly; CARRY/DESCEND2 back-correct the IK target so the actual
+        # cube center (not the TCP) follows the cleared corridor.
+        ref = self.env.grasp_position()
+
+        target, self._grip, advance = self._target_for_phase(ref, blue, goal, reds)
+        joint_cmd = self._ik_step(target, target_grasp_site=True)
         self._phase_step += 1
         if advance:
             self._advance_phase()
@@ -89,29 +168,25 @@ class ScriptedExpert:
 
     def _target_for_phase(
         self,
-        ee: np.ndarray, blue: np.ndarray, goal: np.ndarray, reds: np.ndarray,
+        ref: np.ndarray, blue: np.ndarray, goal: np.ndarray, reds: np.ndarray,
     ) -> tuple[np.ndarray, float, bool]:
-        """Return (ee_target, gripper_cmd, advance).
+        """Return (target, gripper_cmd, advance).
 
-        Targets are *absolute* Cartesian goals for the current phase — the IK
-        solves for the joints that achieve them and the position controller
-        drives there over many env steps. `advance` triggers on actual progress
-        of the live ee (not on the moving-waypoint trick).
+        `target` is the absolute Cartesian position the IK should put the
+        grasp site at. Pre-grasp phases pass waypoints directly; CARRY and
+        DESCEND2 subtract the cube→grasp offset so the cube center tracks
+        the goal, not the TCP. `advance` triggers on actual progress.
         """
         c = self.cfg
         reach_tol = 0.02   # 2 cm tolerance for most phases
 
         if self._phase is _Phase.APPROACH:
             tgt = np.array([blue[0], blue[1], blue[2] + c.pre_grasp_height])
-            return tgt, c.grip_open, np.linalg.norm(ee - tgt) < reach_tol
+            return tgt, c.grip_open, np.linalg.norm(ref - tgt) < reach_tol
 
         if self._phase is _Phase.DESCEND:
-            # Target a small margin ABOVE the cube — the user wants the
-            # gripper at the cube edge with a little tolerance, not driving
-            # a jaw into the cube center. Combined with a tight reach_tol
-            # so the controller actually settles at this offset.
-            tgt = np.array([blue[0], blue[1], blue[2] + c.descend_clearance])
-            return tgt, c.grip_open, np.linalg.norm(ee - tgt) < c.descend_reach_tol
+            tgt = np.array([blue[0], blue[1], c.descend_grasp_z])
+            return tgt, c.grip_open, np.linalg.norm(ref - tgt) < c.descend_reach_tol
 
         if self._phase is _Phase.CLOSE:
             # Hold pose, command the gripper closed, and wait until the jaws
@@ -126,38 +201,51 @@ class ScriptedExpert:
                 and self._phase_step - self._jaws_closed_at >= c.post_grasp_hold_steps
             )
             advance = (self._phase_step >= c.grasp_settle_steps and held_long_enough)
-            return ee, c.grip_closed, advance
+            return ref, c.grip_closed, advance
 
         if self._phase is _Phase.LIFT:
-            # Lift in place (hold XY, raise to the absolute carry height).
-            tgt = np.array([ee[0], ee[1], c.carry_z])
-            return tgt, c.grip_closed, abs(ee[2] - tgt[2]) < reach_tol
+            # Lift in place (hold XY, raise the cube to the absolute carry height).
+            tgt = np.array([ref[0], ref[1], c.carry_z])
+            return tgt, c.grip_closed, abs(ref[2] - tgt[2]) < reach_tol
 
         if self._phase is _Phase.CARRY:
-            # Follow the BFS waypoints precomputed by the layout planner.
-            # Advance to the next waypoint when within `waypoint_reach_tol`.
+            # Drive the held cube along the BFS waypoints. The BFS corridor is
+            # cleared for the CUBE CENTER, so we track and target the cube itself
+            # (not the grasp site). The cube center sits at grasp_site + offset
+            # where offset = _grip_hold_offset rotated into world frame; correct
+            # the IK target so the cube lands on the waypoint, not the grasp site.
+            cube_pos = self.env.blue_cube_position()
+            cube_xy = cube_pos[:2]
+            # If the policy (DAgger) has dragged the cube off the planned
+            # corridor, re-route from where it actually is BEFORE picking a
+            # waypoint, so the relabel routes safely from the current state
+            # instead of steering back toward the stale spawn→goal corridor.
+            self._maybe_replan_carry(cube_xy, reds)
             wps = self.env.layout.carry_waypoints if self.env.layout else []
             if self._wp_idx >= len(wps):
-                # Defensive fallback (shouldn't normally happen).
                 tgt = np.array([goal[0], goal[1], c.carry_z])
                 return tgt, c.grip_closed, True
             wp = wps[self._wp_idx]
-            if np.linalg.norm(ee[:2] - wp) < c.waypoint_reach_tol:
+            if np.linalg.norm(cube_xy - wp) < c.waypoint_reach_tol:
                 self._wp_idx = min(self._wp_idx + 1, len(wps) - 1)
                 wp = wps[self._wp_idx]
-            tgt = np.array([wp[0], wp[1], c.carry_z])
-            # CARRY advances once we're at the *final* waypoint (= goal_xy).
+            # Shift the grasp-site target by the current cube→grasp offset so
+            # the cube center tracks the waypoint rather than the TCP.
+            offset = cube_pos - ref  # world-frame: grasp_site → cube_center
+            tgt = np.array([wp[0] - offset[0], wp[1] - offset[1], c.carry_z - offset[2]])
+            # CARRY advances once the cube is at the final waypoint (= goal_xy).
             done = (self._wp_idx == len(wps) - 1
-                    and np.linalg.norm(ee[:2] - goal[:2]) < 0.03)
+                    and np.linalg.norm(cube_xy - goal[:2]) < 0.03)
             return tgt, c.grip_closed, done
 
         if self._phase is _Phase.DESCEND2:
-            # Hover over the goal CENTER and only release when actually
-            # centered (tight XY tolerance). The cube is glued under the ee
-            # via the magnetic grip, so wherever the ee is at the moment of
-            # release determines where the cube lands.
-            tgt = np.array([goal[0], goal[1], c.pre_release_z])
-            return tgt, c.grip_closed, np.linalg.norm(ee - tgt) < c.descend2_reach_tol
+            # Hover the cube over the goal CENTER. Correct for the cube→grasp offset
+            # so the cube center (not the TCP) lands on the goal.
+            cube_pos = self.env.blue_cube_position()
+            offset = cube_pos - ref
+            tgt = np.array([goal[0] - offset[0], goal[1] - offset[1], c.pre_release_z - offset[2]])
+            done = np.linalg.norm(cube_pos - np.array([goal[0], goal[1], c.pre_release_z])) < c.descend2_reach_tol
+            return tgt, c.grip_closed, done
 
         if self._phase is _Phase.OPEN:
             # Wait for the jaws to *physically* open past the release
@@ -165,9 +253,9 @@ class ScriptedExpert:
             grip_qpos = self.env.gripper_qpos()
             advance = (self._phase_step >= c.release_settle_steps
                        and grip_qpos > c.grasp_open_qpos_threshold)
-            return ee, c.grip_open, advance
+            return ref, c.grip_open, advance
 
-        return ee, self._grip, False
+        return ref, self._grip, False
 
     def _advance_phase(self) -> None:
         order = [
@@ -188,12 +276,14 @@ class ScriptedExpert:
             return target
         return p + d * min(1.0, max_step / n)
 
-    def _ik_step(self, ee_target: np.ndarray) -> np.ndarray:
+    def _ik_step(self, target: np.ndarray, *, target_grasp_site: bool = True) -> np.ndarray:
         """Multi-iteration damped LS IK delegated to the env (which evaluates
-        FK on a data copy)."""
+        FK on a data copy). Solves so the grasp site (jaw-gap center) reaches
+        the target."""
         return self.env.ik_solve(
-            ee_target,
+            target,
             damping=max(self.cfg.ik_damping, 0.15),
             max_iters=self.cfg.ik_max_iters,
             pos_tol=self.cfg.ik_pos_tol,
+            target_grasp_site=target_grasp_site,
         )

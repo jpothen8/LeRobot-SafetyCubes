@@ -25,13 +25,15 @@ from pathlib import Path
 
 import numpy as np
 
+from lerobot.configs.video import VideoEncoderConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
 class EpisodeRecorder:
-    def __init__(self, dataset: LeRobotDataset, n_red_cubes: int) -> None:
+    def __init__(self, dataset: LeRobotDataset, n_red_cubes: int, track_actor: bool = False) -> None:
         self.dataset = dataset
         self.n_red_cubes = n_red_cubes
+        self._track_actor = track_actor
         self._task: str | None = None
         self._frames_in_episode = 0
 
@@ -50,12 +52,19 @@ class EpisodeRecorder:
         fps: int,
         use_videos: bool = True,
         robot_type: str = "so101_sim",
+        camera_encoder: VideoEncoderConfig | None = None,
+        track_actor: bool = False,
     ) -> "EpisodeRecorder":
         H, W = image_size
         n_cube_flat = n_red_cubes * 3
 
         features = {
             "observation.images.agentview": {
+                "dtype": "video" if use_videos else "image",
+                "shape": (H, W, 3),
+                "names": ["height", "width", "channels"],
+            },
+            "observation.images.wrist": {
                 "dtype": "video" if use_videos else "image",
                 "shape": (H, W, 3),
                 "names": ["height", "width", "channels"],
@@ -94,7 +103,11 @@ class EpisodeRecorder:
                 "dtype": "float32", "shape": (1,), "names": ["grasped"],
             },
         }
-        dataset = LeRobotDataset.create(
+        if track_actor:
+            features["privileged.actor"] = {
+                "dtype": "float32", "shape": (1,), "names": ["actor"],
+            }
+        create_kwargs = dict(
             repo_id=repo_id,
             fps=fps,
             features=features,
@@ -102,6 +115,28 @@ class EpisodeRecorder:
             robot_type=robot_type,
             use_videos=use_videos,
         )
+        # Optional hardware (NVENC) / custom video encoder. Default (None) leaves
+        # LeRobot's stock libsvtav1 software encoder in place.
+        if camera_encoder is not None:
+            create_kwargs["camera_encoder"] = camera_encoder
+        dataset = LeRobotDataset.create(**create_kwargs)
+        return cls(dataset=dataset, n_red_cubes=n_red_cubes, track_actor=track_actor)
+
+    @classmethod
+    def resume(
+        cls,
+        *,
+        repo_id: str,
+        root: str | Path | None,
+        n_red_cubes: int,
+    ) -> "EpisodeRecorder":
+        """Append to an existing on-disk dataset (DAgger data aggregation).
+
+        New episodes are added to the dataset already at ``root`` (e.g. a copy
+        of the BC demo set), so training each round sees the demos *plus* every
+        prior round's relabels. Feature schema must match what ``create`` wrote.
+        """
+        dataset = LeRobotDataset.resume(repo_id=repo_id, root=root)
         return cls(dataset=dataset, n_red_cubes=n_red_cubes)
 
     # ----- episode lifecycle --------------------------------------------
@@ -110,11 +145,12 @@ class EpisodeRecorder:
         self._task = task
         self._frames_in_episode = 0
 
-    def add(self, obs: dict, action: np.ndarray, info: dict) -> None:
+    def add(self, obs: dict, action: np.ndarray, info: dict, actor: float = 0.0) -> None:
         if self._task is None:
             raise RuntimeError("begin_episode(task=...) must be called before add().")
         frame = {
             "observation.images.agentview": _to_uint8(obs["image"]),
+            "observation.images.wrist": _to_uint8(obs["wrist_image"]),
             "observation.state": np.asarray(obs["state"], dtype=np.float32),
             "action": np.asarray(action, dtype=np.float32),
             "privileged.cube_positions": np.asarray(info["cube_positions"], dtype=np.float32).reshape(-1),
@@ -125,6 +161,8 @@ class EpisodeRecorder:
             "privileged.grasped": np.array([float(info["grasped"])], dtype=np.float32),
             "task": self._task,
         }
+        if self._track_actor:
+            frame["privileged.actor"] = np.array([actor], dtype=np.float32)
         self.dataset.add_frame(frame)
         self._frames_in_episode += 1
 

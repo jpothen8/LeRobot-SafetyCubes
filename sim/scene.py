@@ -78,7 +78,7 @@ def _find_path(
     reds: list[np.ndarray], blue_xy: np.ndarray, goal_xy: np.ndarray, *,
     clearance: float, grid_res: float,
     bounds_x: tuple[float, float], bounds_y: tuple[float, float],
-    waypoint_stride: int = 6,
+    waypoint_stride: int = 3,
 ) -> list[np.ndarray] | None:
     """BFS over a 2D grid. Returns a list of (x, y) world-frame waypoints
     leading blue→goal while staying ≥ `clearance` from every red cube center,
@@ -158,6 +158,50 @@ def _find_path(
     return waypoints
 
 
+def _path_bounds(cfg: SceneConfig) -> tuple[tuple[float, float], tuple[float, float]]:
+    """XY search region for the BFS planner: a touch wider than the obstacle
+    square in x, spanning the full blue→goal extent in y (the arm reaches
+    roughly x ∈ [0.10, 0.40]). Shared by :func:`sample_layout` (the initial
+    spawn→goal plan) and :func:`plan_carry_path` (mid-carry replans) so both
+    search the identical grid."""
+    cx, cy = cfg.red_field_center
+    field_half = cfg.red_field_size / 2
+    bounds_x = (cx - field_half - 0.02, cx + field_half + 0.02)
+    blue_y_max = max(cfg.blue_y_range)
+    goal_y = cfg.goal_pos[1]
+    pad = 0.03
+    bounds_y = (min(goal_y, -blue_y_max) - pad, max(blue_y_max, abs(goal_y)) + pad)
+    return bounds_x, bounds_y
+
+
+def plan_carry_path(
+    cfg: SceneConfig, red_centers, start_xy, goal_xy,
+) -> list[np.ndarray] | None:
+    """Replan a collision-free carry corridor from an ARBITRARY start XY to the
+    goal, reusing the same BFS / clearance / grid / bounds as the initial layout
+    plan.
+
+    Returns blue→goal XY waypoints kept ≥ ``path_clearance_radius`` from every
+    red-cube center, or ``None`` if no clearance-respecting path exists from
+    ``start_xy`` (e.g. the start already sits inside a red's clearance disk).
+
+    The expert calls this to re-route after the policy has dragged the held cube
+    off the original spawn→goal corridor during DAgger mixing: the relabel then
+    follows a valid route from where the cube actually is, not a drive back
+    across the field to a stale corridor. ``red_centers`` may be (n, 2) or
+    (n, 3) — only the XY columns are used."""
+    reds = [np.asarray(c, dtype=np.float64)[:2] for c in np.asarray(red_centers)]
+    bounds_x, bounds_y = _path_bounds(cfg)
+    return _find_path(
+        reds,
+        np.asarray(start_xy, dtype=np.float64),
+        np.asarray(goal_xy, dtype=np.float64),
+        clearance=cfg.path_clearance_radius,
+        grid_res=cfg.path_grid_res,
+        bounds_x=bounds_x, bounds_y=bounds_y,
+    )
+
+
 def _sample_red_centers(
     cfg: SceneConfig, rng: np.random.Generator,
     blue_xy: np.ndarray, goal_xy: np.ndarray,
@@ -193,16 +237,8 @@ def sample_layout(cfg: SceneConfig, rng: np.random.Generator) -> Layout:
     """Sample a workable scene: blue on +y, goal at the fixed -y point,
     6 red cubes in the obstacle square, with a guaranteed connectivity path
     from blue→goal."""
-    # Path-check region: a bit wider than the obstacle square in x, full
-    # blue→goal y-span vertically. The arm reaches roughly x ∈ [0.10, 0.40].
-    cx, cy = cfg.red_field_center
-    field_half = cfg.red_field_size / 2
-    bounds_x = (cx - field_half - 0.02, cx + field_half + 0.02)
-    blue_y_max = max(cfg.blue_y_range)
-    goal_y = cfg.goal_pos[1]
-    pad = 0.03
-    bounds_y = (min(goal_y, -blue_y_max) - pad, max(blue_y_max, abs(goal_y)) + pad)
-
+    # Path-check region shared with mid-carry replans (see _path_bounds).
+    bounds_x, bounds_y = _path_bounds(cfg)
     goal_xy = np.array(cfg.goal_pos, dtype=np.float64)
 
     for attempt in range(cfg.max_layout_attempts):
@@ -341,13 +377,16 @@ def _add_world_decor(spec: mujoco.MjSpec, cfg: SceneConfig) -> None:
 
 
 def _add_wrist_camera(spec: mujoco.MjSpec, cfg: SceneConfig) -> None:
-    """Mount a wrist camera on gripper_link looking at the grasp area.
+    """Mount a wrist camera *rigidly* on gripper_link, like a real bolted-on
+    USB cam (the standard LeRobot setup).
 
-    The SO-101 URDF doesn't ship a camera, but a wrist-mounted USB cam is
-    the standard LeRobot setup. We attach it to `gripper_link` so the view
-    moves with the gripper, and use `targetbody` mode pointed at the
-    moving_jaw so MuJoCo keeps the camera oriented at the grasp point even
-    as the arm pose changes.
+    The camera is parented to `gripper_link`, so it rides with the wrist. We
+    use `fixed` mode (NOT `targetbody`): targetbody auto-aims at a target and
+    gimbal-locks the roll to world-up, so the image would *not* roll with
+    `wrist_roll` — unphysical for a bolted-on camera. With `fixed` mode the
+    whole camera frame is rigid in the gripper, so it rotates with the wrist.
+    The orientation is frozen post-compile by `_freeze_wrist_camera_orientation`
+    (it needs forward kinematics, unavailable at spec-build time).
     """
     body = next((b for b in spec.bodies if b.name == "gripper_link"), None)
     if body is None:
@@ -355,15 +394,97 @@ def _add_wrist_camera(spec: mujoco.MjSpec, cfg: SceneConfig) -> None:
     body.add_camera(
         name=cfg.wrist_camera_name,
         pos=list(cfg.wrist_camera_pos),
-        mode=mujoco.mjtCamLight.mjCAMLIGHT_TARGETBODY,
-        targetbody="moving_jaw_so101_v1_link",
+        mode=mujoco.mjtCamLight.mjCAMLIGHT_FIXED,
         fovy=cfg.wrist_camera_fovy,
     )
 
 
+def _freeze_wrist_camera_orientation(model: mujoco.MjModel, cfg: SceneConfig) -> None:
+    """Freeze the wrist camera's orientation in the gripper frame.
+
+    Frames the gripper so it sits centered and pointing straight up:
+      * optical axis aimed at the gripper's geometric centroid  → centered;
+      * roll set so the gripper's reach direction (gripper_link → the grasp
+        `ee_site`, i.e. the way the fingers point) projects to image-up  →
+        the gripper stands vertical, fingers up.
+    Everything is computed in the gripper frame, so the orientation stays
+    correct if `wrist_camera_pos` changes. Baked into `cam_quat` with
+    `mode=fixed`, so the frame is rigid in `gripper_link` and rolls with
+    `wrist_roll` like a real bolted-on camera. Must run post-compile (uses FK).
+    """
+    cid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, cfg.wrist_camera_name)
+    gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "gripper_link")
+    sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, cfg.ee_site_name)
+    if cid < 0 or gid < 0 or sid < 0:
+        return
+
+    # FK at the home pose on a throwaway buffer (geometry within the gripper is
+    # arm-pose-independent, but the gripper jaw opening is set by home_gripper).
+    data = mujoco.MjData(model)
+    for nm, val in zip(cfg.arm_joint_names, cfg.home_qpos):
+        j = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, nm)
+        if j >= 0:
+            data.qpos[model.jnt_qposadr[j]] = val
+    gj = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, cfg.gripper_joint_name)
+    if gj >= 0:
+        data.qpos[model.jnt_qposadr[gj]] = cfg.home_gripper
+    mujoco.mj_forward(model, data)
+
+    gmat = data.xmat[gid].reshape(3, 3)
+    gpos = data.xpos[gid]
+
+    def to_local(p):
+        return gmat.T @ (p - gpos)
+
+    def in_gripper_subtree(b):
+        while b > 0:
+            if b == gid:
+                return True
+            b = int(model.body_parentid[b])
+        return False
+
+    centers = [to_local(data.geom_xpos[g]) for g in range(model.ngeom)
+               if in_gripper_subtree(int(model.geom_bodyid[g]))]
+    centroid = np.mean(centers, axis=0) if centers else np.zeros(3)
+    reach = to_local(data.site_xpos[sid])           # gripper_link → grasp point
+
+    cam = np.array(cfg.wrist_camera_pos)
+    fwd = centroid - cam
+    fwd /= np.linalg.norm(fwd) + 1e-9               # aim at centroid → centered
+    up = reach / (np.linalg.norm(reach) + 1e-9)     # reach dir → image up
+    # Camera frame (in gripper frame): x=right, y=up, z=back(-fwd).
+    z = -fwd
+    y = up - (up @ z) * z
+    y /= np.linalg.norm(y) + 1e-9
+    x = np.cross(y, z)
+    x /= np.linalg.norm(x) + 1e-9
+    R = np.column_stack([x, y, z])
+
+    # Extra upward tilt: rotate the camera about its own right axis so the
+    # optical axis pitches up toward the gripper's reach (keeps it horizontally
+    # centered and vertical).
+    a = np.radians(cfg.wrist_camera_pitch_up_deg)
+    c, s = np.cos(a), np.sin(a)
+    R = R @ np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+
+    quat = np.zeros(4)
+    mujoco.mju_mat2Quat(quat, R.flatten())
+
+    model.cam_mode[cid] = int(mujoco.mjtCamLight.mjCAMLIGHT_FIXED)
+    model.cam_targetbodyid[cid] = -1
+    model.cam_quat[cid] = quat
+
+
 def _add_ee_site(spec: mujoco.MjSpec, cfg: SceneConfig) -> None:
     """Add an end-effector tracking site. The SO-101 URDF already has a dummy
-    `gripper_frame_link` body at the gripper tip — we hang the site on it."""
+    `gripper_frame_link` body at the gripper tip — we hang the site on it.
+
+    Also add a `grasp_site` at the jaw-gap center (midway between the open
+    finger faces, at the fingertip plane). The URDF gripper frame sits at the
+    FIXED jaw, ~3 cm to the side of where a grasped cube actually goes, so
+    targeting it perches the cube on one jaw instead of between them. The
+    grasp site is the true tool-center point: IK and the magnetic grip target
+    it so the cube ends up centered between the fingers."""
     target_name = "gripper_frame_link"
     body = next((b for b in spec.bodies if b.name == target_name), None)
     if body is None:
@@ -375,6 +496,13 @@ def _add_ee_site(spec: mujoco.MjSpec, cfg: SceneConfig) -> None:
         pos=[0.0, 0.0, 0.0],
         size=[0.005, 0.005, 0.005],
         rgba=[1.0, 1.0, 0.0, 0.6],
+        group=3,
+    )
+    body.add_site(
+        name=cfg.grasp_site_name,
+        pos=list(cfg.grasp_site_offset),
+        size=[0.005, 0.005, 0.005],
+        rgba=[0.0, 1.0, 1.0, 0.6],
         group=3,
     )
 
@@ -515,6 +643,8 @@ def build_scene(cfg: SceneConfig, layout: Layout) -> tuple[mujoco.MjModel, mujoc
         if is_arm_link or is_flattened_base:
             model.geom_contype[g] = 2
             model.geom_conaffinity[g] = 1
+
+    _freeze_wrist_camera_orientation(model, cfg)
 
     return model, spec
 
