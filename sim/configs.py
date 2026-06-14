@@ -246,6 +246,21 @@ class ExpertConfig:
     # the TCP (held cube) is within this XY tolerance of it.
     waypoint_reach_tol: float = 0.025
 
+    # CARRY-phase off-corridor replan threshold (m, XY). If the held cube drifts
+    # farther than this from the CLOSEST waypoint of the current carry path, the
+    # expert re-runs the BFS planner from the cube's CURRENT position to the goal
+    # and follows that fresh corridor. ~0 in pure-expert demos (the expert tracks
+    # waypoints within waypoint_reach_tol, so the closest waypoint is always
+    # near); fires in DAgger when the policy has carried the cube off the original
+    # spawn→goal corridor — so the relabel is a valid collision-free route from
+    # where the policy actually left the cube, not a drive back across the field
+    # to a stale corridor. Waypoints are spaced ~1.5 cm (axis-aligned stride) up
+    # to ~2.1 cm (8-connected diagonal stride 3·√2·grid_res, plus the goal-snap
+    # final segment), so a cube sitting perfectly mid-corridor is at most ~half a
+    # stride (~1.1 cm) from its closest waypoint — this 4 cm threshold clears that
+    # comfortably and only fires on genuine off-corridor drift. Set ≤ 0 to disable.
+    replan_offpath_threshold: float = 0.04
+
     # Damped least-squares IK.
     ik_damping: float = 0.05
     ik_max_iters: int = 20

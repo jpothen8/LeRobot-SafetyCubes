@@ -78,7 +78,7 @@ def _find_path(
     reds: list[np.ndarray], blue_xy: np.ndarray, goal_xy: np.ndarray, *,
     clearance: float, grid_res: float,
     bounds_x: tuple[float, float], bounds_y: tuple[float, float],
-    waypoint_stride: int = 6,
+    waypoint_stride: int = 3,
 ) -> list[np.ndarray] | None:
     """BFS over a 2D grid. Returns a list of (x, y) world-frame waypoints
     leading blue→goal while staying ≥ `clearance` from every red cube center,
@@ -158,6 +158,50 @@ def _find_path(
     return waypoints
 
 
+def _path_bounds(cfg: SceneConfig) -> tuple[tuple[float, float], tuple[float, float]]:
+    """XY search region for the BFS planner: a touch wider than the obstacle
+    square in x, spanning the full blue→goal extent in y (the arm reaches
+    roughly x ∈ [0.10, 0.40]). Shared by :func:`sample_layout` (the initial
+    spawn→goal plan) and :func:`plan_carry_path` (mid-carry replans) so both
+    search the identical grid."""
+    cx, cy = cfg.red_field_center
+    field_half = cfg.red_field_size / 2
+    bounds_x = (cx - field_half - 0.02, cx + field_half + 0.02)
+    blue_y_max = max(cfg.blue_y_range)
+    goal_y = cfg.goal_pos[1]
+    pad = 0.03
+    bounds_y = (min(goal_y, -blue_y_max) - pad, max(blue_y_max, abs(goal_y)) + pad)
+    return bounds_x, bounds_y
+
+
+def plan_carry_path(
+    cfg: SceneConfig, red_centers, start_xy, goal_xy,
+) -> list[np.ndarray] | None:
+    """Replan a collision-free carry corridor from an ARBITRARY start XY to the
+    goal, reusing the same BFS / clearance / grid / bounds as the initial layout
+    plan.
+
+    Returns blue→goal XY waypoints kept ≥ ``path_clearance_radius`` from every
+    red-cube center, or ``None`` if no clearance-respecting path exists from
+    ``start_xy`` (e.g. the start already sits inside a red's clearance disk).
+
+    The expert calls this to re-route after the policy has dragged the held cube
+    off the original spawn→goal corridor during DAgger mixing: the relabel then
+    follows a valid route from where the cube actually is, not a drive back
+    across the field to a stale corridor. ``red_centers`` may be (n, 2) or
+    (n, 3) — only the XY columns are used."""
+    reds = [np.asarray(c, dtype=np.float64)[:2] for c in np.asarray(red_centers)]
+    bounds_x, bounds_y = _path_bounds(cfg)
+    return _find_path(
+        reds,
+        np.asarray(start_xy, dtype=np.float64),
+        np.asarray(goal_xy, dtype=np.float64),
+        clearance=cfg.path_clearance_radius,
+        grid_res=cfg.path_grid_res,
+        bounds_x=bounds_x, bounds_y=bounds_y,
+    )
+
+
 def _sample_red_centers(
     cfg: SceneConfig, rng: np.random.Generator,
     blue_xy: np.ndarray, goal_xy: np.ndarray,
@@ -193,16 +237,8 @@ def sample_layout(cfg: SceneConfig, rng: np.random.Generator) -> Layout:
     """Sample a workable scene: blue on +y, goal at the fixed -y point,
     6 red cubes in the obstacle square, with a guaranteed connectivity path
     from blue→goal."""
-    # Path-check region: a bit wider than the obstacle square in x, full
-    # blue→goal y-span vertically. The arm reaches roughly x ∈ [0.10, 0.40].
-    cx, cy = cfg.red_field_center
-    field_half = cfg.red_field_size / 2
-    bounds_x = (cx - field_half - 0.02, cx + field_half + 0.02)
-    blue_y_max = max(cfg.blue_y_range)
-    goal_y = cfg.goal_pos[1]
-    pad = 0.03
-    bounds_y = (min(goal_y, -blue_y_max) - pad, max(blue_y_max, abs(goal_y)) + pad)
-
+    # Path-check region shared with mid-carry replans (see _path_bounds).
+    bounds_x, bounds_y = _path_bounds(cfg)
     goal_xy = np.array(cfg.goal_pos, dtype=np.float64)
 
     for attempt in range(cfg.max_layout_attempts):

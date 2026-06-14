@@ -34,6 +34,7 @@ import numpy as np
 
 from .configs import ExpertConfig
 from .env import SafeCubeEnv
+from .scene import plan_carry_path
 
 
 class _Phase(Enum):
@@ -65,6 +66,68 @@ class ScriptedExpert:
         self._grip = self.cfg.grip_open
         self._wp_idx = 0
         self._jaws_closed_at = -1
+
+    def sync_wp_to_cube(self) -> None:
+        """Advance _wp_idx past waypoints the cube has already moved beyond.
+
+        Call this when the expert resumes CARRY after a policy chunk. While the
+        policy controlled the arm, _wp_idx was frozen; if the policy carried the
+        cube forward past several BFS waypoints the expert will otherwise target
+        stale (behind-the-cube) waypoints and drive the arm backward.
+
+        The heuristic: a waypoint is "passed" if it is farther from the goal than
+        the cube currently is (plus a small tolerance to avoid skipping ahead of
+        the cube on noise). We only advance, never retreat.
+        """
+        if self._phase is not _Phase.CARRY:
+            return
+        wps = self.env.layout.carry_waypoints if self.env.layout else []
+        if not wps:
+            return
+        goal_xy = self.env.layout.goal_xy
+        cube_xy = self.env.blue_cube_position()[:2]
+        dist_cube_goal = float(np.linalg.norm(cube_xy - goal_xy))
+        while (self._wp_idx < len(wps) - 1 and
+               np.linalg.norm(wps[self._wp_idx] - goal_xy) > dist_cube_goal + 0.02):
+            self._wp_idx += 1
+
+    def _maybe_replan_carry(self, cube_xy: np.ndarray, reds: np.ndarray) -> None:
+        """Re-route the carry corridor if the held cube has drifted off it.
+
+        ``sync_wp_to_cube`` only fixes *along-path* progress (the waypoint
+        index); it cannot help when the policy has pushed the cube *laterally*
+        off the corridor, where the original spawn→goal waypoints no longer
+        describe a safe route from the cube's position (following them can drive
+        the arm back across the field or straight through a red).
+
+        When the cube ("the arm's state", measured at the cube center the
+        corridor is cleared for) is farther than ``replan_offpath_threshold``
+        from the CLOSEST current waypoint, re-run the BFS planner from the cube's
+        CURRENT XY to the goal and adopt that fresh corridor (``_wp_idx`` reset
+        to 0). Uses the live red positions so the route respects any cubes the
+        rollout has nudged. No-op when disabled, before any path exists, when the
+        cube is still on-corridor, or when no clearance-respecting path exists
+        from here (keep the old path rather than steer through an obstacle).
+
+        Fires only in DAgger: the pure expert tracks waypoints within
+        ``waypoint_reach_tol`` (≪ threshold), so the closest waypoint is always
+        near and this never triggers during demonstration collection.
+        """
+        thr = self.cfg.replan_offpath_threshold
+        if thr <= 0 or self.env.layout is None:
+            return
+        wps = self.env.layout.carry_waypoints
+        if not wps:
+            return
+        closest = float(np.linalg.norm(np.asarray(wps) - cube_xy, axis=1).min())
+        if closest <= thr:
+            return
+        new_path = plan_carry_path(
+            self.env.cfg.scene, reds, cube_xy, self.env.layout.goal_xy,
+        )
+        if new_path:
+            self.env.layout.carry_waypoints = new_path
+            self._wp_idx = 0
 
     # ----- public --------------------------------------------------------
 
@@ -151,12 +214,17 @@ class ScriptedExpert:
             # (not the grasp site). The cube center sits at grasp_site + offset
             # where offset = _grip_hold_offset rotated into world frame; correct
             # the IK target so the cube lands on the waypoint, not the grasp site.
+            cube_pos = self.env.blue_cube_position()
+            cube_xy = cube_pos[:2]
+            # If the policy (DAgger) has dragged the cube off the planned
+            # corridor, re-route from where it actually is BEFORE picking a
+            # waypoint, so the relabel routes safely from the current state
+            # instead of steering back toward the stale spawn→goal corridor.
+            self._maybe_replan_carry(cube_xy, reds)
             wps = self.env.layout.carry_waypoints if self.env.layout else []
             if self._wp_idx >= len(wps):
                 tgt = np.array([goal[0], goal[1], c.carry_z])
                 return tgt, c.grip_closed, True
-            cube_pos = self.env.blue_cube_position()
-            cube_xy = cube_pos[:2]
             wp = wps[self._wp_idx]
             if np.linalg.norm(cube_xy - wp) < c.waypoint_reach_tol:
                 self._wp_idx = min(self._wp_idx + 1, len(wps) - 1)
