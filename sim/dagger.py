@@ -165,17 +165,27 @@ def collect_dagger_round(
     stats = RoundStats(alpha=alpha)
     pure_expert = policy is None or alpha >= 1.0
 
-    def choose_executed(expert_action: np.ndarray, obs: dict, info: dict) -> np.ndarray:
-        # Execute the expert w.p. alpha, else the policy rolled the SAME (queued)
-        # way it is deployed, so DAgger visits the deployment distribution. The
-        # label recorded inside run_expert_episode is always the expert action.
-        if rng.random() < alpha:
-            return expert_action
-        return policy.act_queued(obs, task)
+    _prev_was_policy: list[bool] = [False]
+
+    def choose_executed(
+        expert_action: np.ndarray, obs: dict, info: dict
+    ) -> tuple[np.ndarray, float]:
+        use_expert = rng.random() < alpha
+        if use_expert:
+            if _prev_was_policy[0]:
+                # Snap _wp_idx past waypoints the policy already carried the cube
+                # through, otherwise the expert targets stale behind-cube waypoints
+                # and drives the arm backward on the handoff.
+                expert.sync_wp_to_cube()
+            _prev_was_policy[0] = False
+            return expert_action, 0.0
+        _prev_was_policy[0] = True
+        return policy.act_queued(obs, task), 1.0
 
     for ep in range(n_episodes):
         if policy is not None:
             policy.reset()  # reset the action queue once per episode (queued rollout)
+        _prev_was_policy[0] = False  # reset transition tracker per episode
         # SAME expert path as sim.scripts.collect_demos -> identical labels.
         s = run_expert_episode(
             env=env, expert=expert, rec=rec, task=task,

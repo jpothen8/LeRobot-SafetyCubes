@@ -30,9 +30,10 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
 class EpisodeRecorder:
-    def __init__(self, dataset: LeRobotDataset, n_red_cubes: int) -> None:
+    def __init__(self, dataset: LeRobotDataset, n_red_cubes: int, track_actor: bool = False) -> None:
         self.dataset = dataset
         self.n_red_cubes = n_red_cubes
+        self._track_actor = track_actor
         self._task: str | None = None
         self._frames_in_episode = 0
 
@@ -52,6 +53,7 @@ class EpisodeRecorder:
         use_videos: bool = True,
         robot_type: str = "so101_sim",
         camera_encoder: VideoEncoderConfig | None = None,
+        track_actor: bool = False,
     ) -> "EpisodeRecorder":
         H, W = image_size
         n_cube_flat = n_red_cubes * 3
@@ -101,6 +103,10 @@ class EpisodeRecorder:
                 "dtype": "float32", "shape": (1,), "names": ["grasped"],
             },
         }
+        if track_actor:
+            features["privileged.actor"] = {
+                "dtype": "float32", "shape": (1,), "names": ["actor"],
+            }
         create_kwargs = dict(
             repo_id=repo_id,
             fps=fps,
@@ -114,7 +120,7 @@ class EpisodeRecorder:
         if camera_encoder is not None:
             create_kwargs["camera_encoder"] = camera_encoder
         dataset = LeRobotDataset.create(**create_kwargs)
-        return cls(dataset=dataset, n_red_cubes=n_red_cubes)
+        return cls(dataset=dataset, n_red_cubes=n_red_cubes, track_actor=track_actor)
 
     @classmethod
     def resume(
@@ -139,7 +145,7 @@ class EpisodeRecorder:
         self._task = task
         self._frames_in_episode = 0
 
-    def add(self, obs: dict, action: np.ndarray, info: dict) -> None:
+    def add(self, obs: dict, action: np.ndarray, info: dict, actor: float = 0.0) -> None:
         if self._task is None:
             raise RuntimeError("begin_episode(task=...) must be called before add().")
         frame = {
@@ -155,6 +161,8 @@ class EpisodeRecorder:
             "privileged.grasped": np.array([float(info["grasped"])], dtype=np.float32),
             "task": self._task,
         }
+        if self._track_actor:
+            frame["privileged.actor"] = np.array([actor], dtype=np.float32)
         self.dataset.add_frame(frame)
         self._frames_in_episode += 1
 

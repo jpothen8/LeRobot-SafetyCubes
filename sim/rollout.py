@@ -23,8 +23,9 @@ from .env import SafeCubeEnv
 from .expert import ScriptedExpert
 from .recorder import EpisodeRecorder
 
-# choose_executed(expert_action, obs, info) -> action actually stepped in the env.
-ChooseExecuted = Callable[[np.ndarray, dict, dict], np.ndarray]
+# choose_executed(expert_action, obs, info) -> (action, actor_label)
+# actor_label: 0.0 = expert, 1.0 = policy
+ChooseExecuted = Callable[[np.ndarray, dict, dict], tuple[np.ndarray, float]]
 
 
 def run_expert_episode(
@@ -67,12 +68,12 @@ def run_expert_episode(
         else:
             expert_action = expert.act(info)
 
-        executed = (
-            expert_action if choose_executed is None
-            else choose_executed(expert_action, obs, info)
-        )
+        if choose_executed is None:
+            executed, actor = expert_action, 0.0
+        else:
+            executed, actor = choose_executed(expert_action, obs, info)
         # DAgger relabel / demonstration: always record the EXPERT action.
-        rec.add(obs, expert_action, info)
+        rec.add(obs, expert_action, info, actor=actor)
         obs, _, terminated, truncated, info = env.step(executed)
 
     return info["stats"]
