@@ -190,9 +190,24 @@ collection. Variety: every episode's blue spawn and red layout are unique
 importing it registers `safe_pi0`, after which all standard `--policy.* /
 --dataset.* / --batch_size / --steps` args apply. **Training does not render**
 (it decodes the dataset videos via torchcodec), so EGL is irrelevant here — just
-set the alloc config:
+set the alloc config.
+
+> ⚠️ **ALWAYS launch training inside a `tmux` session — never as a plain
+> background job.** A backgrounded `python` dies on SSH/session disconnect (we
+> lost a DAgger run that way); `tmux` survives disconnects, and the per-`save_freq`
+> checkpoints + `--resume` survive box reboots. Pattern: `tmux new -s <name>`, then
+> run the command piped to `tee <log>` so it's both on-screen and logged.
+>
+> ⚠️ **ALWAYS enable wandb so the run is viewable:**
+> `--wandb.enable=true --wandb.disable_artifact=true --wandb.project=safe-cube`
+> (entity `models-university-of-california-berkeley1717`). `disable_artifact=true`
+> stops it uploading the ~22 GB checkpoints. **Gotcha:** `--resume=true` makes
+> wandb try to resume the *prior* run and errors if that run had wandb off
+> (`Couldn't get the previous WandB run ID`) — enable wandb from the **first**
+> launch, or restart fresh.
 
 ```bash
+tmux new -s dagger_r1     # then, INSIDE the tmux session:
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=$PWD .venv/bin/python \
   -m sim.scripts.train_safe_pi0 \
   --policy.type=safe_pi0 --policy.pretrained_path=lerobot/pi0_base \
@@ -200,7 +215,8 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=$PWD .venv/bin/pytho
   --policy.gradient_checkpointing=true \
   --dataset.repo_id=local/safe-cube-mixed --dataset.root=data/safe_cube_v5 \
   --output_dir=outputs/safe_pi0_bc --batch_size=48 --steps=20000 --save_freq=2000 \
-  > outputs/bc_train.log 2>&1
+  --wandb.enable=true --wandb.disable_artifact=true --wandb.project=safe-cube \
+  2>&1 | tee outputs/bc_train.log
 ```
 
 - **REQUIRED: `--policy.push_to_hub=false`** (else `validate()` errors on a
@@ -231,8 +247,14 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=$PWD .venv/bin/pytho
 - `sim/scripts/record_policy_rollout.py` — render a trained checkpoint rolling out.
   **Its default `--seed 100` OVERLAPS training layouts (seeds 0..1599) and
   flatters the numbers** — pass `--seed 2000` (or any ≥ collection N).
+- **ALWAYS pass `--action-chunking`.** π0 is trained with `chunk_size=n_action_steps=50`;
+  the gripper close is a deferred mid-chunk event. Without this flag, `act()` resamples
+  every step — the policy hovers at the cube and **never closes the jaws** (0% grasp,
+  0% success). `--action-chunking` uses `act_queued`, which executes the full 50-step
+  plan open-loop and re-infers only when the queue drains.
 - `sim.evaluate.evaluate()` reports success / red-contact / clearance / ceiling
-  rates; wrap a checkpoint with `sim.dagger.PolicyRollout` and pass `.act`.
+  rates; wrap a checkpoint with `sim.dagger.PolicyRollout` and pass `.act_queued`
+  with a per-episode `policy.reset()`.
 - `sim/scripts/record_rollout.py` — scripted-expert demo (the `videos/demo*` trio).
 - All of these RENDER → run with `env -u DISPLAY MUJOCO_GL=egl`, and verify
   non-black.
@@ -241,7 +263,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=$PWD .venv/bin/pytho
 env -u DISPLAY MUJOCO_GL=egl PYTHONPATH=$PWD .venv/bin/python -m sim.scripts.record_policy_rollout \
   --checkpoint outputs/safe_pi0_bc/checkpoints/last/pretrained_model \
   --dataset-repo-id local/safe-cube-mixed --dataset-root data/safe_cube_v5 \
-  --out videos/bc_rollout.mp4 --n-episodes 6 --seed 2000
+  --out videos/bc_rollout.mp4 --n-episodes 6 --seed 2000 --action-chunking
 ```
 
 ---
