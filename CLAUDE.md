@@ -149,14 +149,20 @@ variety, clearance controls gripper safety. Don't re-couple them.
 
 ## 1. Collect data (scripted expert → BC dataset)
 
-`sim/scripts/collect_demos.py`. Current working command (8-cube weaving, clean):
+`sim/scripts/collect_demos.py`. Current working command (8-cube weaving, A* expert, clean):
 
 ```bash
 env -u DISPLAY MUJOCO_GL=egl PYTHONPATH=$PWD .venv/bin/python -m sim.scripts.collect_demos \
-  --repo-id local/safe-cube-mixed --root data/safe_cube_v5 \
+  --repo-id local/safe-cube-mixed --root data/safe_cube_v6 \
   --successes-only --n-red-cubes 8 --max-steps 500 --n-episodes 1600 --seed 0 \
-  > outputs/collect_v5.log 2>&1
+  --path-clearance-weight 1.0 \
+  > outputs/collect_v6.log 2>&1
 ```
+
+`--path-clearance-weight 1.0` enables the cost-field A* corridor planner, which bows expert
+paths toward the center of free gaps rather than hugging the clearance boundary (BFS default).
+λ=1.0 threads tight gaps; λ≥3 tends to route around the field — sweep if paths look timid.
+Add `--path-wall-field-sides` alongside a high λ to force through-field weaving.
 
 - **`--successes-only`** drops failures. `collect_demos` *also* unconditionally
   drops any `fly_over` episode (a demo of going *over* an obstacle is poison for
@@ -247,10 +253,11 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=$PWD .venv/bin/pytho
 - `sim/scripts/record_policy_rollout.py` — render a trained checkpoint rolling out.
   **Its default `--seed 100` OVERLAPS training layouts (seeds 0..1599) and
   flatters the numbers** — pass `--seed 2000` (or any ≥ collection N).
-- **ALWAYS pass `--action-chunking`.** π0 is trained with `chunk_size=n_action_steps=50`;
+- **ALWAYS pass `--action-chunking`.** π0 is trained with `chunk_size=n_action_steps=30`
+  (overridden in `SafePI0Config`; the LeRobot upstream default is 50);
   the gripper close is a deferred mid-chunk event. Without this flag, `act()` resamples
   every step — the policy hovers at the cube and **never closes the jaws** (0% grasp,
-  0% success). `--action-chunking` uses `act_queued`, which executes the full 50-step
+  0% success). `--action-chunking` uses `act_queued`, which executes the full 30-step
   plan open-loop and re-infers only when the queue drains.
 - `sim.evaluate.evaluate()` reports success / red-contact / clearance / ceiling
   rates; wrap a checkpoint with `sim.dagger.PolicyRollout` and pass `.act_queued`
@@ -401,7 +408,8 @@ marks the anchor frame (not part of this spec).
 - Flags: `--gate-margin` (≈0.03 m), `--max-anchors` (≈3), `--cooldown-steps`
   (≈20), `--dropoff-radius` (≈0.05 m), optional `--branch-cap` (limit branch length
   past the anchor; default = run to completion), `--successes-only/--no-successes-only`
-  (default on), plus the usual `--checkpoint / --dataset-repo-id / --dataset-root /
+  (default on), `--path-clearance-weight` (A* λ, default 1.0), `--path-wall-field-sides`,
+  plus the usual `--checkpoint / --dataset-repo-id / --dataset-root /
   --repo-id / --root / --n-red-cubes / --max-steps / --seed / --n-workers / --vcodec`.
 
 **Intended command** (held-out seeds ≥ collection N; `--dataset-*` = the BC set the
@@ -413,12 +421,13 @@ env -u DISPLAY MUJOCO_GL=egl PYTHONPATH=$PWD .venv/bin/python \
   -m sim.scripts.collect_dagger_cleanup \
   --repo-id local/safe-cube-cleanup --root data/safe_cube_cleanup \
   --checkpoint outputs/safe_pi0_bc_v6/checkpoints/last/pretrained_model \
-  --dataset-repo-id local/safe-cube-mixed --dataset-root data/safe_cube_v5 \
+  --dataset-repo-id local/safe-cube-mixed --dataset-root data/safe_cube_v6 \
   --n-red-cubes 8 --max-steps 500 --n-episodes 400 --seed 2000 \
-  --gate-margin 0.03 --max-anchors 3 --n-workers 4
+  --gate-margin 0.03 --max-anchors 3 --n-workers 4 \
+  --path-clearance-weight 1.0
 
 # then aggregate with the BC set and retrain (serial), as in §2:
-#   aggregate_datasets([safe_cube_v5, safe_cube_cleanup]) → data/safe_cube_v7
+#   aggregate_datasets([safe_cube_v6, safe_cube_cleanup]) → data/safe_cube_v7
 #   train_safe_pi0, resume from the BC v6 checkpoint, low LR, early-stop on success
 ```
 

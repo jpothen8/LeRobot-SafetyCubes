@@ -2,7 +2,7 @@
 
 The replacement for the deprecated α-mixing DAgger
 (``sim.scripts.collect_dagger_parallel`` / ``sim.dagger.collect_dagger_round``),
-which regressed BC by stitching expert/policy actions *inside* π0's 50-step
+which regressed BC by stitching expert/policy actions *inside* π0's action
 chunk → incoherent ("Frankenstein") flow-matching targets. See CLAUDE.md §4 /
 README.md §3 for the full diagnosis.
 
@@ -16,8 +16,8 @@ label*, so no recorded chunk ever straddles two actors. Per episode:
 2. **Anchor (gate).** A **near-violation in the weave phase** —
    ``grasped`` AND ``env.current_clearance() < gate_margin`` AND the cube is not
    yet at the goal (``> dropoff_radius``) — *triggers* an anchor, but the snapshot
-   we keep is the **chunk-planning boundary**, not the danger frame. π0 executes a
-   50-step chunk open-loop, so a near-violation is the consequence of the chunk the
+   we keep is the **chunk-planning boundary**, not the danger frame. π0 executes an
+   action chunk open-loop, so a near-violation is the consequence of the chunk the
    policy planned at the last queue-refill (≤ chunk-length steps earlier); the only
    on-policy state a chunked policy can be corrected at is the one it *planned
    from*. So the scout snapshots each grasped weave-phase planning boundary
@@ -99,7 +99,7 @@ def scout_for_anchors(
     re-triggers for ``cooldown_steps`` env steps, and caps at ``max_anchors``.
 
     **The returned snapshot is the chunk-PLANNING boundary, not the danger frame.**
-    π0 executes a 50-step chunk open-loop; a near-violation is the *consequence* of
+    π0 executes an action chunk open-loop; a near-violation is the *consequence* of
     the chunk the policy planned at the last queue-refill (≤ chunk-length steps
     earlier). To correct a chunked policy you must relabel the on-policy state it
     *planned from* — the only place it can be corrected — so on each near-violation
@@ -178,7 +178,12 @@ def _collect_block(payload: dict) -> dict:
     branch_cap = payload["branch_cap"]
     successes_only = payload["successes_only"]
 
-    scene = SceneConfig(n_red_cubes=payload["n_red"])
+    scene = SceneConfig(
+        n_red_cubes=payload["n_red"],
+        path_clearance_weight=payload["path_clearance_weight"],
+        path_clearance_pref=payload["path_clearance_pref"],
+        path_wall_field_sides=payload["path_wall_field_sides"],
+    )
     # terminate_on_red_contact=False: the scout must keep rolling past finger
     # grazes to surface multiple near-violations, and a branch (which starts from
     # a near-violation) shouldn't die on the first graze — branch quality is
@@ -306,6 +311,14 @@ def parse_args() -> argparse.Namespace:
                         "else 'libsvtav1' software. Pass an explicit codec to force it.")
     p.add_argument("--keep-shards", action="store_true",
                    help="don't delete the per-worker shard datasets after merge")
+    # ── A* corridor planner (used by the expert in each branch) ─────────────
+    p.add_argument("--path-clearance-weight", type=float, default=1.0,
+                   help="A* soft-clearance weight λ: 0 = plain BFS; >0 = cost-field A* "
+                        "that bows corridors toward gap centers (λ≥3 routes around the field)")
+    p.add_argument("--path-clearance-pref", type=float, default=0.04,
+                   help="extra standoff (m) beyond the hard clearance radius the planner prefers")
+    p.add_argument("--path-wall-field-sides", action="store_true",
+                   help="hard-block lateral margins so A* weaves through the field (use with high λ)")
     return p.parse_args()
 
 
@@ -340,6 +353,9 @@ def main() -> None:
             cooldown_steps=args.cooldown_steps, dropoff_radius=args.dropoff_radius,
             branch_cap=args.branch_cap, successes_only=args.successes_only,
             vcodec=args.vcodec,
+            path_clearance_weight=args.path_clearance_weight,
+            path_clearance_pref=args.path_clearance_pref,
+            path_wall_field_sides=args.path_wall_field_sides,
         ))
 
     # Fresh shard dirs.

@@ -110,6 +110,12 @@ class SafePI0Config(PI0Config):
     knob — sweep it first.
     """
 
+    # Action chunk length. Shorter chunks re-plan more often, which matters for
+    # recovery: a 30-step chunk at ~10 Hz ≈ 3 s — enough for a full grasp or a
+    # weave correction while still being much shorter than a full carry (~10 s).
+    chunk_size: int = 30
+    n_action_steps: int = 30
+
     # Safety loss weighting and shape.
     safety_weight: float = 1.0            # λ — task vs. safety trade-off
     sdf_alpha: float = 50.0               # sigmoid sharpness (1/m)
