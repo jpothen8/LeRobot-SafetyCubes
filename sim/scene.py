@@ -15,14 +15,21 @@ Layout sampling (per project spec):
 
 from __future__ import annotations
 
+import heapq
+import math
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import mujoco
 import numpy as np
+from scipy.ndimage import distance_transform_edt
 
 from .configs import SceneConfig
+
+_SQRT2 = math.sqrt(2.0)
+# 8-connected grid moves (orthogonal + diagonal), shared by both search modes.
+_NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
 
 
 @dataclass
@@ -74,16 +81,113 @@ _JOINT_DAMPING = 2.0
 _JOINT_ARMATURE = 0.01
 
 
+def _bfs_parents(
+    blocked: np.ndarray, src: tuple[int, int], dst: tuple[int, int],
+) -> dict[tuple[int, int], tuple[int, int]] | None:
+    """Breadth-first search → parent map. Minimizes the number of cells, so the
+    route is the shortest free path and *hugs* the clearance boundary (every
+    point ≥ `clearance` from a red is equally good to it, so it picks the
+    tightest). Returns ``None`` if ``dst`` is unreachable from ``src``."""
+    nx, ny = blocked.shape
+    visited = np.zeros_like(blocked)
+    parent: dict[tuple[int, int], tuple[int, int]] = {}
+    q: deque[tuple[int, int]] = deque([src])
+    visited[src] = True
+    while q:
+        cur = q.popleft()
+        if cur == dst:
+            break
+        for di, dj in _NEIGHBORS:
+            ni, nj = cur[0] + di, cur[1] + dj
+            if not (0 <= ni < nx and 0 <= nj < ny):
+                continue
+            if visited[ni, nj] or blocked[ni, nj]:
+                continue
+            visited[ni, nj] = True
+            parent[(ni, nj)] = cur
+            q.append((ni, nj))
+    return parent if visited[dst] else None
+
+
+def _astar_parents(
+    blocked: np.ndarray, src: tuple[int, int], dst: tuple[int, int], *,
+    grid_res: float, clearance_weight: float, clearance_pref: float,
+) -> dict[tuple[int, int], tuple[int, int]] | None:
+    """Clearance-penalized A* → parent map. Same hard ``blocked`` constraint as
+    :func:`_bfs_parents` (so finger safety is still guaranteed), but each step
+    into a cell within ``clearance_pref`` metres of the blocked region pays an
+    extra cost of up to ``clearance_weight``× its length. The optimal route
+    therefore bows toward the *middle* of the free corridors instead of grazing
+    the clearance boundary — the "stay as far from every red as the gap allows"
+    path the BFS can't express.
+
+    Cost field comes from the Euclidean distance transform of the free space
+    (distance, in metres, from each free cell to the nearest blocked cell —
+    ``blocked`` already bakes in the hard clearance radius, so this measures the
+    *extra* standoff beyond it). The penalty saturates at ``clearance_pref``: a
+    cell that far out (or farther) is free, so there is no reward for straying
+    even farther → the path doesn't get shoved into the workspace walls.
+
+    Heuristic is straight-line distance to ``dst``; since every edge costs at
+    least its geometric length, the heuristic never overestimates → the search
+    stays admissible/consistent and the returned path is cost-optimal. Returns
+    ``None`` if ``dst`` is unreachable from ``src``."""
+    nx, ny = blocked.shape
+    edt = distance_transform_edt(~blocked) * grid_res
+    inv_pref = 1.0 / clearance_pref if clearance_pref > 0 else 0.0
+
+    def repulse(cell: tuple[int, int]) -> float:
+        # 1 at the clearance boundary, ramping linearly to 0 at clearance_pref.
+        return max(0.0, 1.0 - edt[cell] * inv_pref)
+
+    def heuristic(cell: tuple[int, int]) -> float:
+        return grid_res * math.hypot(cell[0] - dst[0], cell[1] - dst[1])
+
+    best_g: dict[tuple[int, int], float] = {src: 0.0}
+    parent: dict[tuple[int, int], tuple[int, int]] = {}
+    closed = np.zeros_like(blocked)
+    heap: list[tuple[float, float, tuple[int, int]]] = [(heuristic(src), 0.0, src)]
+    while heap:
+        _, g, cur = heapq.heappop(heap)
+        if cur == dst:
+            return parent
+        if closed[cur]:
+            continue
+        closed[cur] = True
+        for di, dj in _NEIGHBORS:
+            ni, nj = cur[0] + di, cur[1] + dj
+            if not (0 <= ni < nx and 0 <= nj < ny):
+                continue
+            if blocked[ni, nj] or closed[ni, nj]:
+                continue
+            nbr = (ni, nj)
+            step = grid_res * (_SQRT2 if di and dj else 1.0)
+            ng = g + step * (1.0 + clearance_weight * repulse(nbr))
+            if ng < best_g.get(nbr, math.inf):
+                best_g[nbr] = ng
+                parent[nbr] = cur
+                heapq.heappush(heap, (ng + heuristic(nbr), ng, nbr))
+    return parent if dst in parent else None
+
+
 def _find_path(
     reds: list[np.ndarray], blue_xy: np.ndarray, goal_xy: np.ndarray, *,
     clearance: float, grid_res: float,
     bounds_x: tuple[float, float], bounds_y: tuple[float, float],
     waypoint_stride: int = 3,
+    clearance_weight: float = 0.0, clearance_pref: float = 0.0,
 ) -> list[np.ndarray] | None:
-    """BFS over a 2D grid. Returns a list of (x, y) world-frame waypoints
-    leading blue→goal while staying ≥ `clearance` from every red cube center,
-    or `None` if no such path exists. Waypoints are downsampled every
-    `waypoint_stride` cells; goal_xy is always the final waypoint.
+    """Plan a 2D grid path of (x, y) world-frame waypoints leading blue→goal
+    while staying ≥ `clearance` from every red cube center, or `None` if no such
+    path exists. Waypoints are downsampled every `waypoint_stride` cells;
+    goal_xy is always the final waypoint.
+
+    Search mode (the hard clearance constraint is identical either way):
+      * ``clearance_weight <= 0`` (default) → plain BFS shortest path, which
+        hugs the clearance boundary (:func:`_bfs_parents`).
+      * ``clearance_weight > 0`` → clearance-penalized A* that prefers the
+        middle of the free corridors, staying up to ``clearance_pref`` metres
+        clear where the geometry allows (:func:`_astar_parents`).
     """
     x0, x1 = bounds_x
     y0, y1 = bounds_y
@@ -118,25 +222,14 @@ def _find_path(
     if blocked[src] or blocked[dst]:
         return None
 
-    visited = np.zeros_like(blocked)
-    parent: dict[tuple[int, int], tuple[int, int]] = {}
-    q: deque[tuple[int, int]] = deque([src])
-    visited[src] = True
-    while q:
-        cur = q.popleft()
-        if cur == dst:
-            break
-        for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1),
-                       (1, 1), (1, -1), (-1, 1), (-1, -1)):
-            ni, nj = cur[0] + di, cur[1] + dj
-            if not (0 <= ni < nx and 0 <= nj < ny):
-                continue
-            if visited[ni, nj] or blocked[ni, nj]:
-                continue
-            visited[ni, nj] = True
-            parent[(ni, nj)] = cur
-            q.append((ni, nj))
-    if not visited[dst]:
+    if clearance_weight > 0.0:
+        parent = _astar_parents(
+            blocked, src, dst, grid_res=grid_res,
+            clearance_weight=clearance_weight, clearance_pref=clearance_pref,
+        )
+    else:
+        parent = _bfs_parents(blocked, src, dst)
+    if parent is None:
         return None
 
     # Reconstruct path by walking parents back to src.
@@ -199,6 +292,8 @@ def plan_carry_path(
         clearance=cfg.path_clearance_radius,
         grid_res=cfg.path_grid_res,
         bounds_x=bounds_x, bounds_y=bounds_y,
+        clearance_weight=cfg.path_clearance_weight,
+        clearance_pref=cfg.path_clearance_pref,
     )
 
 
@@ -254,6 +349,8 @@ def sample_layout(cfg: SceneConfig, rng: np.random.Generator) -> Layout:
             clearance=cfg.path_clearance_radius,
             grid_res=cfg.path_grid_res,
             bounds_x=bounds_x, bounds_y=bounds_y,
+            clearance_weight=cfg.path_clearance_weight,
+            clearance_pref=cfg.path_clearance_pref,
         )
         if waypoints is None:
             continue

@@ -95,6 +95,24 @@ class SceneConfig:
     path_grid_res: float = 0.005
     # Number of resample attempts before giving up.
     max_layout_attempts: int = 100
+    # ── Corridor planner mode (BFS vs clearance-penalized A*) ────────────
+    # `path_clearance_radius` above is a HARD constraint either way. These two
+    # knobs add a SOFT preference on top of it, switching the planner from plain
+    # shortest-path BFS (which hugs the clearance boundary) to a cost-field A*
+    # that bows the corridor toward the middle of the free gaps — "stay as far
+    # from every red as the layout allows", which aligns the expert demos with
+    # the policy's safety loss instead of fighting it.
+    #   path_clearance_weight (λ): 0.0 → plain BFS (default, unchanged behavior);
+    #     >0 → A* where stepping at the clearance boundary costs (1+λ)× its
+    #     length, so the planner accepts up to ~λ× extra detour to gain full
+    #     standoff. SWEEP THIS. Too large over-avoids (longer/timid carries,
+    #     routes around tight pairs it could thread) — see CLAUDE.md.
+    #   path_clearance_pref: extra standoff (m) BEYOND path_clearance_radius the
+    #     planner tries to keep. The soft penalty ramps from full at the hard
+    #     boundary to zero at this distance and saturates there (no incentive to
+    #     stray farther → corridors don't get shoved into the workspace walls).
+    path_clearance_weight: float = 0.0
+    path_clearance_pref: float = 0.04
 
     # ── Table / ceiling ──────────────────────────────────────────────────
     table_z: float = 0.0
