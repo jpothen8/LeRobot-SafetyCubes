@@ -268,36 +268,158 @@ env -u DISPLAY MUJOCO_GL=egl PYTHONPATH=$PWD .venv/bin/python -m sim.scripts.rec
 
 ---
 
-## 4. DAgger (after BC works)
+## 4. DAgger — "cleanup" branch-and-relabel (after BC works)
 
-`sim/scripts/dagger.py` runs the full collect→relabel→retrain loop. Round 0 is
-pure expert; later rounds load the previous checkpoint, mix in policy actions
-(`alpha = alpha0 ** round`), and **always label with the expert** (privileged
-state, so labels are valid even where the policy misbehaves). Shells out to
-`train_safe_pi0` per round. Run collection rounds with `env -u DISPLAY
-MUJOCO_GL=egl`. See `sim/README.md` (the `sim.scripts.dagger` command) for the
-full invocation; point `--base-policy` at the BC checkpoint's
-`last/pretrained_model`.
+> **Status: IMPLEMENTED.** Collector `sim/scripts/collect_dagger_cleanup.py`;
+> env primitives `SafeCubeEnv.snapshot/restore/current_clearance`;
+> `run_expert_episode(restore_state=)`; round-trip test
+> `sim/tests/test_snapshot_restore.py`. (Not yet *run* at scale — validate a
+> retrain before trusting it.) The old α-mixing DAgger
+> (`sim/scripts/dagger.py`, `sim/scripts/collect_dagger_parallel.py`,
+> `sim.dagger.collect_dagger_round`) is **DEPRECATED — do not use.** It regressed
+> BC v6 from **75 % (6/8) → 0/6** rollout success (`outputs/rollout_dagger_r1.log`:
+> drove into the field, 3/6 red contacts, timeouts). Root cause and the
+> replacement are below. `PolicyRollout` in `sim/dagger.py` is still good and is
+> reused by the new method.
 
-**GPU-accelerated collection (`sim/scripts/collect_dagger_parallel.py`).** A
-drop-in for the *collection phase only* — same expert/policy mixing and
-always-label-with-expert invariant as `collect_dagger_round`, but sharded across
-`--n-workers` spawn processes (each its own EGL/MuJoCo/CUDA + NVENC + π0 copy),
-merged with `aggregate_datasets`. Keeps fly-overs (the label is the carry-low
-expert → policy-induced fly-over states are corrective, not poison). Retrain
-serially with `train_safe_pi0` afterward, as in `dagger.py`. **VRAM: ~18 GB per
-worker → `--n-workers 4` is comfortably safe on the 96 GB box (default 4), 5+
-crowds the 75–85 GB target.** Point `--dataset-repo-id/--dataset-root` at the
-dataset the checkpoint was trained on (norm stats), `--repo-id/--root` at where
-the new relabels are written, and `--seed` ≥ collection N to stay held out:
+**Why the old DAgger regressed.** π0 predicts a **50-step chunk executed
+open-loop** (`--action-chunking` / `act_queued`, see §3). The old collector
+executed a per-step Bernoulli expert/policy mix and relabeled every frame with the
+expert. Fatal combination:
+1. It switched actor every `switch_interval` steps (default 10) ≪ chunk 50, with
+   hard `policy.reset()` / `sync_wp_to_cube()` discontinuities *mid-chunk*. Every
+   recorded 50-step training chunk straddled ~5 switches → a "Frankenstein"
+   flow-matching target → the policy learned jaggedy, incoherent chunks.
+2. Deeper: wherever *executed ≠ recorded* (any policy-driven frame) the recorded
+   chunk is the expert's reactive 1-step relabel along the policy's path, not a
+   coherent expert plan. Chunk-aligned switching doesn't fix this; even rare
+   handoffs pollute a full chunk-length (50) of training-window offsets each.
+
+**The replacement — cleanup DAgger (branch-and-relabel / on-policy-anchored expert
+demos).** Decouple *generating on-policy states* from *recording the label*. Never
+mix actors in recorded data:
+
+1. **Scout (NOT recorded).** Roll the **policy** open-loop (`PolicyRollout.act_queued`)
+   for the whole episode from `env.reset(seed)`. Only job: find where the policy
+   gets in trouble. Discarded.
+2. **Anchor (gate) — at the chunk-PLANNING boundary, not the danger frame.** A
+   **near-violation in the weave phase** *triggers* an anchor: `grasped` AND
+   `env.current_clearance() < gate_margin` AND the cube isn't at the goal yet
+   (excludes pickup = pre-grasp, and dropoff = cube within `dropoff_radius` of
+   goal). But the snapshot we **branch from** is the most recent grasped weave-phase
+   **planning boundary** (`len(action_queue) == 0` → the policy re-infers a fresh
+   chunk), **not** the frame where the cube is already next to the red. **Why:** π0
+   executes a 50-step chunk open-loop, so a near-violation is the *consequence* of
+   the chunk the policy planned at the last queue-refill (≤ chunk-length steps
+   earlier); the only on-policy state a chunked policy can be corrected at is the
+   one it *planned from*. Snapshotting at the danger frame trains
+   `(danger → recovery)`, which the policy — mid-chunk, not re-planning at the
+   danger — almost never invokes; snapshotting at the boundary trains
+   `(planning state → coherent safe chunk)`, which is what actually steers it clear.
+   (Relabeling the policy's *per-step* pre-danger path instead would reintroduce the
+   Frankenstein incoherence — the expert's reactive actions along the policy's path
+   aren't a coherent plan.) Rising-edge + cooldown + per-episode `max_anchors` cap.
+3. **Branch / relabel.** `env.restore(boundary_snap)`, then run the **pure scripted
+   expert to completion** from there, recorded as one normal episode — identical to
+   `collect_demos` (`run_expert_episode(..., choose_executed=None,
+   restore_state=snap)`), **except** the expert first re-roots its BFS carry corridor
+   at the restored cube position (`replan_carry_from_current`) so it weaves
+   *forward* from the on-policy state, never back toward the spawn→goal waypoints
+   sitting behind it. Every recorded episode is 100 % expert → coherent chunks,
+   smooth, zero handoffs; its **first frame is `(on-policy planning state →
+   coherent safe expert chunk)`** — the correct DAgger relabel for a chunked policy.
+
+**No hand-back** — scout and cleanup are *separate* rollouts sharing only a start
+state; the expert never returns control to the policy, it just finishes. That is
+what avoids the inline-handoff jaggedness (expert pose ≠ where the policy resumes).
+
+**Mid-episode demos train cleanly** because π0 here is `n_obs_steps=1` — purely
+state-conditioned (single obs → 50-chunk), no history / step counter. A branched
+cleanup frame is indistinguishable from a BC frame; a partial demo is valid
+`(state → coherent expert chunk)` pairs from harder states. Risky states are only
+ever inputs, never targets (scout discarded) → labels teach **recovery, not
+risk-seeking**. (Would only break if `n_obs_steps > 1` — it isn't.)
+
+**Visualizing.** A recorded cleanup episode starts *at the anchor* — cube already
+grasped, mid-field, close to a red — and shows the pure expert weaving out to the
+goal. The policy **scout is NOT recorded**, so the dataset has no footage of the
+policy driving *into* trouble; `visualize_dataset_episodes.py` will (correctly)
+play a clip that opens in a near-violation. It already handles the absent
+`privileged.actor` field (`track_actor=False`) gracefully — prints
+`actor tracking=no` and shows `?` in the actor banner, no crash. To actually *see*
+the policy cause the near-violation you'd add a debug render of the scout that
+marks the anchor frame (not part of this spec).
+
+**Retrain hygiene** (aggregate cleanup with the **full BC set**, then
+`train_safe_pi0` serially as in §2):
+- Training weights by **frame** count; cleanup episodes are short → collect enough
+  anchors × scouts (or upweight) to matter, but not so many you induce
+  **over-avoidance** (timid field-avoidance / timeouts).
+- Fine-tune from the BC checkpoint, **low LR / fewer steps**, early-stop on rollout
+  **success** (loss is not a clean signal — see §2).
+
+**The pieces (all built — file/function map):**
+- `sim/env.py`:
+  - `snapshot() -> dict` — copy `data.qpos/qvel/act/ctrl/time` **and** the
+    magnetic-grip state `_attached` / `_grip_offset` / `_min_grip_qpos`. The grip
+    is a kinematic lock maintained *outside* the physics state; omit it and the
+    held cube desyncs from the gripper on restore. (`data.act` may be size-0 —
+    guard the copy/restore.)
+  - `restore(snap) -> (obs, privileged)` — write the state back, `mj_forward`,
+    `self._stats = EpisodeStats()`, return `_observe()/_privileged()`. **Same**
+    model/layout/renderer — does NOT rebuild the layout (the point: the cleanup
+    runs in the scout's exact world; snapshots are valid only for that env
+    instance).
+  - `current_clearance() -> float` — instantaneous ee→nearest-red signed clearance
+    (live version of the running `stats['min_clearance']`; replicate the box-SDF
+    loop in `_update_episode_state` step 5).
+- `sim/expert.py`: `replan_carry_from_current(reds)` — BFS a fresh carry corridor
+  from the cube's CURRENT position to the goal and reset `_wp_idx=0` on it.
+  Unconditional (does NOT depend on `_maybe_replan_carry`'s off-path threshold), so
+  a branch always weaves *forward* from the restored on-policy state instead of
+  chasing the spawn→goal waypoints behind it (which would drive the arm backward).
+- `sim/rollout.py`: `restore_state=None` on `run_expert_episode`; when set, start
+  from `env.restore(restore_state)` instead of `env.reset(seed)` **and** call
+  `expert.replan_carry_from_current(info["cube_positions"])` once before the loop
+  (rest unchanged — same pure-expert path `collect_demos` uses).
+- `sim/scripts/collect_dagger_cleanup.py`: parallel collector built on the
+  `collect_dagger_parallel.py` scaffolding (spawn workers, disjoint seed blocks,
+  shard → `aggregate_datasets`, `--vcodec auto` NVENC, ~18 GB π0/worker →
+  `--n-workers 4` safe, 5+ crowds the 75–85 GB target). Per scout episode the
+  module-level `scout_for_anchors()` runs the `PolicyRollout.act_queued` rollout +
+  the gate; it tracks the latest grasped weave-phase **planning boundary**
+  (`len(policy.policy._action_queue) == 0`) and, on a near-violation, returns that
+  boundary snapshot (not the danger frame, see step 2 above), deduped by identity.
+  Then a pure-expert branch per anchor via `run_expert_episode(restore_state=snap)`.
+  The recorder uses **`track_actor=False`**
+  (every frame is expert → no `privileged.actor` field → aggregates with the BC set
+  with NO stripping — unlike the deprecated collector, see [[dagger-aggregate-strip-actor]]).
+  Branch hygiene mirrors `collect_demos`: drop fly-overs **and** finger-clip red
+  contacts always, and (under `--successes-only`, **default on**) non-successes —
+  so the cleanup set matches the BC set's clean distribution. The scout env uses
+  `terminate_on_red_contact=False` so neither the scout nor a branch dies on a graze.
+- Flags: `--gate-margin` (≈0.03 m), `--max-anchors` (≈3), `--cooldown-steps`
+  (≈20), `--dropoff-radius` (≈0.05 m), optional `--branch-cap` (limit branch length
+  past the anchor; default = run to completion), `--successes-only/--no-successes-only`
+  (default on), plus the usual `--checkpoint / --dataset-repo-id / --dataset-root /
+  --repo-id / --root / --n-red-cubes / --max-steps / --seed / --n-workers / --vcodec`.
+
+**Intended command** (held-out seeds ≥ collection N; `--dataset-*` = the BC set the
+checkpoint was trained on, for norm stats; `--repo-id/--root` = where the new
+cleanup demos are written):
 
 ```bash
 env -u DISPLAY MUJOCO_GL=egl PYTHONPATH=$PWD .venv/bin/python \
-  -m sim.scripts.collect_dagger_parallel \
-  --repo-id local/safe-cube-dagger --root data/safe_cube_dagger \
-  --checkpoint outputs/safe_pi0_bc/checkpoints/last/pretrained_model \
+  -m sim.scripts.collect_dagger_cleanup \
+  --repo-id local/safe-cube-cleanup --root data/safe_cube_cleanup \
+  --checkpoint outputs/safe_pi0_bc_v6/checkpoints/last/pretrained_model \
   --dataset-repo-id local/safe-cube-mixed --dataset-root data/safe_cube_v5 \
-  --alpha 0.5 --n-red-cubes 8 --max-steps 500 --n-episodes 400 --seed 2000 --n-workers 4
+  --n-red-cubes 8 --max-steps 500 --n-episodes 400 --seed 2000 \
+  --gate-margin 0.03 --max-anchors 3 --n-workers 4
+
+# then aggregate with the BC set and retrain (serial), as in §2:
+#   aggregate_datasets([safe_cube_v5, safe_cube_cleanup]) → data/safe_cube_v7
+#   train_safe_pi0, resume from the BC v6 checkpoint, low LR, early-stop on success
 ```
 
 ---
