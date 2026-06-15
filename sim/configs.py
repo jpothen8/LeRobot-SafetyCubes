@@ -91,8 +91,12 @@ class SceneConfig:
     # discards ~42% of episodes to clips; it is an experimental setting, not a free
     # lunch. Do NOT raise above sep/2 without accepting route-around.
     path_clearance_radius: float = 0.045
-    # Grid resolution for the BFS in sample_layout.
-    path_grid_res: float = 0.005
+    # Grid spacing (m) of the corridor-planner search grid (shared by the BFS
+    # and the clearance-penalized A*). Finer = smoother corridors, less
+    # 8-connected staircasing, and a higher-resolution clearance/EDT field for
+    # A* to optimize against; cost is ~(1/res)^2 cells, but the grid is tiny so
+    # 2.5 mm (~135x190 cells) still plans in milliseconds.
+    path_grid_res: float = 0.0025
     # Number of resample attempts before giving up.
     max_layout_attempts: int = 100
     # ── Corridor planner mode (BFS vs clearance-penalized A*) ────────────
