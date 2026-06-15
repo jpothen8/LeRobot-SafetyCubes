@@ -90,6 +90,8 @@ def parse_args() -> argparse.Namespace:
                    help="use act_queued (execute full chunk before re-planning) instead of per-step re-inference")
     p.add_argument("--ghost-alpha", type=float, default=0.6,
                    help="opacity of the expert ghost silhouette (0..1)")
+    p.add_argument("--n-action-steps", type=int, default=None,
+                   help="override policy config n_action_steps (chunk execution length)")
     return p.parse_args()
 
 
@@ -268,6 +270,9 @@ def main() -> None:
         dataset_root=args.dataset_root,
         device=args.device,
     )
+    if args.n_action_steps is not None:
+        policy.policy.config.n_action_steps = args.n_action_steps
+        policy.policy.reset()
 
     agent_writer = _open_writer(agent_path, args.fps, (W, H))
     wrist_writer = _open_writer(wrist_path, args.fps, (W, H))

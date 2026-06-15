@@ -618,6 +618,75 @@ class SafeCubeEnv:
             mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, nm)
         ]) for nm in self.cfg.scene.arm_joint_names]
 
+    def current_clearance(self) -> float:
+        """Instantaneous signed clearance (box SDF) from the ee to the NEAREST
+        red cube surface — the live, single-step version of the running
+        ``stats['min_clearance']`` (which is a min over the whole episode).
+
+        Used by the cleanup-DAgger gate to detect near-violations *while* the
+        scout policy is rolling. Positive = clear (outside), negative =
+        penetrating. Returns ``+inf`` if there is no ee site or no red cubes.
+        Replicates the box-SDF loop in ``_update_episode_state`` step 5."""
+        assert self.data is not None
+        if self._ee_site_id < 0 or len(self._red_body_ids) == 0:
+            return float("inf")
+        ee_pos = self.data.site_xpos[self._ee_site_id]
+        half = self.cfg.scene.red_cube_half
+        best = float("inf")
+        for bid in self._red_body_ids:
+            center = self.data.xpos[bid]
+            d_box = np.maximum(np.abs(ee_pos - center) - half, 0.0)
+            outside = float(np.linalg.norm(d_box))
+            inside = min(max(float(np.max(np.abs(ee_pos - center) - half)), -1.0), 0.0)
+            clearance = outside + inside
+            if clearance < best:
+                best = clearance
+        return best
+
+    def snapshot(self) -> dict[str, Any]:
+        """Full sim + magnetic-grip state, for branch-and-relabel DAgger.
+
+        Copies the MuJoCo physics state (``qpos/qvel/act/ctrl/time``) **and** the
+        magnetic-grip bookkeeping (``_attached`` / ``_grip_offset`` /
+        ``_min_grip_qpos``), which lives *outside* ``data.*`` — omit it and the
+        held cube desyncs from the gripper on :meth:`restore`. ``data.act`` may be
+        size-0 (no stateful actuators); a size-0 ``copy()`` is harmless and
+        :meth:`restore` guards the write. The snapshot is valid **only** for this
+        env instance (same model / layout / renderer)."""
+        assert self.data is not None
+        return {
+            "qpos": self.data.qpos.copy(),
+            "qvel": self.data.qvel.copy(),
+            "act": self.data.act.copy(),
+            "ctrl": self.data.ctrl.copy(),
+            "time": float(self.data.time),
+            "attached": bool(self._attached),
+            "grip_offset": self._grip_offset.copy(),
+            "min_grip_qpos": float(self._min_grip_qpos),
+        }
+
+    def restore(self, snap: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Restore a :meth:`snapshot` into THIS env; return ``(obs, privileged)``.
+
+        Writes the physics + magnetic-grip state back, re-runs forward kinematics,
+        and starts a FRESH :class:`EpisodeStats` so the branched episode's stats
+        reflect only the branch. Does **not** rebuild the model / layout /
+        renderer — the cleanup branch runs in the snapshot's exact world (a
+        snapshot is only valid for the env instance that produced it)."""
+        assert self.model is not None and self.data is not None
+        self.data.qpos[:] = snap["qpos"]
+        self.data.qvel[:] = snap["qvel"]
+        if self.data.act.size:
+            self.data.act[:] = snap["act"]
+        self.data.ctrl[:] = snap["ctrl"]
+        self.data.time = snap["time"]
+        self._attached = bool(snap["attached"])
+        self._grip_offset = np.asarray(snap["grip_offset"]).copy()
+        self._min_grip_qpos = float(snap["min_grip_qpos"])
+        mujoco.mj_forward(self.model, self.data)
+        self._stats = EpisodeStats()
+        return self._observe(), self._privileged()
+
     def ik_solve(self, ee_target: np.ndarray, *, damping: float = 0.2,
                   max_iters: int = 30, pos_tol: float = 0.003,
                   max_dq: float = 0.4, target_grasp_site: bool = False) -> np.ndarray:
