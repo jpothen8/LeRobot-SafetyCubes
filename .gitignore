@@ -191,3 +191,5 @@ commands.txt
 !sim/assets/**/*.stl
 !sim/assets/**/*.urdf
 !sim/assets/**/*.xml
+
+CLAUDE.md

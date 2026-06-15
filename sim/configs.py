@@ -91,10 +91,38 @@ class SceneConfig:
     # discards ~42% of episodes to clips; it is an experimental setting, not a free
     # lunch. Do NOT raise above sep/2 without accepting route-around.
     path_clearance_radius: float = 0.045
-    # Grid resolution for the BFS in sample_layout.
-    path_grid_res: float = 0.005
+    # Grid spacing (m) of the corridor-planner search grid (shared by the BFS
+    # and the clearance-penalized A*). Finer = smoother corridors, less
+    # 8-connected staircasing, and a higher-resolution clearance/EDT field for
+    # A* to optimize against; cost is ~(1/res)^2 cells, but the grid is tiny so
+    # 2.5 mm (~135x190 cells) still plans in milliseconds.
+    path_grid_res: float = 0.0025
     # Number of resample attempts before giving up.
     max_layout_attempts: int = 100
+    # ── Corridor planner mode (BFS vs clearance-penalized A*) ────────────
+    # `path_clearance_radius` above is a HARD constraint either way. These two
+    # knobs add a SOFT preference on top of it, switching the planner from plain
+    # shortest-path BFS (which hugs the clearance boundary) to a cost-field A*
+    # that bows the corridor toward the middle of the free gaps — "stay as far
+    # from every red as the layout allows", which aligns the expert demos with
+    # the policy's safety loss instead of fighting it.
+    #   path_clearance_weight (λ): 0.0 → plain BFS (default, unchanged behavior);
+    #     >0 → A* where stepping at the clearance boundary costs (1+λ)× its
+    #     length, so the planner accepts up to ~λ× extra detour to gain full
+    #     standoff. SWEEP THIS. Too large over-avoids (longer/timid carries,
+    #     routes around tight pairs it could thread) — see CLAUDE.md.
+    #   path_clearance_pref: extra standoff (m) BEYOND path_clearance_radius the
+    #     planner tries to keep. The soft penalty ramps from full at the hard
+    #     boundary to zero at this distance and saturates there (no incentive to
+    #     stray farther → corridors don't get shoved into the workspace walls).
+    path_clearance_weight: float = 0.0
+    path_clearance_pref: float = 0.04
+    # Side barriers: when True, hard-block the lateral margins outside the red
+    # field's x-extent (the route the cost-field A* would otherwise detour
+    # AROUND the field along when path_clearance_weight is large). Forces the
+    # corridor to weave *through* the interior even at high λ. No effect on BFS
+    # (λ=0) layouts, which don't route around. Pairs with a large λ.
+    path_wall_field_sides: bool = False
 
     # ── Table / ceiling ──────────────────────────────────────────────────
     table_z: float = 0.0
