@@ -113,6 +113,12 @@ class SceneConfig:
     #     stray farther → corridors don't get shoved into the workspace walls).
     path_clearance_weight: float = 0.0
     path_clearance_pref: float = 0.04
+    # Side barriers: when True, hard-block the lateral margins outside the red
+    # field's x-extent (the route the cost-field A* would otherwise detour
+    # AROUND the field along when path_clearance_weight is large). Forces the
+    # corridor to weave *through* the interior even at high λ. No effect on BFS
+    # (λ=0) layouts, which don't route around. Pairs with a large λ.
+    path_wall_field_sides: bool = False
 
     # ── Table / ceiling ──────────────────────────────────────────────────
     table_z: float = 0.0

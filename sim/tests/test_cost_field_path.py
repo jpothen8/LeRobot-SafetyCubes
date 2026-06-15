@@ -99,3 +99,22 @@ def test_connectivity_matches_bfs_when_blocked():
     bfs = _find_path(wall, BLUE, GOAL, **common)
     astar = _find_path(wall, BLUE, GOAL, clearance_weight=3.0, clearance_pref=0.05, **common)
     assert bfs is None and astar is None
+
+
+def test_wall_x_confines_path_and_blocks_route_around():
+    # A red dead-center between start (bottom) and goal (top) lets a high-λ A*
+    # bow far sideways to avoid it. wall_x must keep every waypoint inside the
+    # band, so the corridor weaves past the red instead of routing around it.
+    blue, goal = np.array([0.20, 0.04]), np.array([0.20, 0.36])
+    reds = [np.array([0.20, 0.20])]
+    wall = (0.10, 0.30)
+    common = dict(clearance=CLEARANCE, grid_res=GRID_RES,
+                  bounds_x=BOUNDS_X, bounds_y=BOUNDS_Y,
+                  clearance_weight=3.0, clearance_pref=0.05)
+    free = np.array(_find_path(reds, blue, goal, **common))
+    walled = np.array(_find_path(reds, blue, goal, wall_x=wall, **common))
+    # The walled path stays within the barrier (± one grid cell of rounding)…
+    assert walled[:, 0].min() >= wall[0] - GRID_RES
+    assert walled[:, 0].max() <= wall[1] + GRID_RES
+    # …and is laterally tighter than the unwalled route-around.
+    assert np.ptp(walled[:, 0]) < np.ptp(free[:, 0])

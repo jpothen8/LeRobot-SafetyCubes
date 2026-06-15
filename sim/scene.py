@@ -176,6 +176,7 @@ def _find_path(
     bounds_x: tuple[float, float], bounds_y: tuple[float, float],
     waypoint_stride: int = 3,
     clearance_weight: float = 0.0, clearance_pref: float = 0.0,
+    wall_x: tuple[float, float] | None = None,
 ) -> list[np.ndarray] | None:
     """Plan a 2D grid path of (x, y) world-frame waypoints leading blue→goal
     while staying ≥ `clearance` from every red cube center, or `None` if no such
@@ -188,6 +189,13 @@ def _find_path(
       * ``clearance_weight > 0`` → clearance-penalized A* that prefers the
         middle of the free corridors, staying up to ``clearance_pref`` metres
         clear where the geometry allows (:func:`_astar_parents`).
+
+    ``wall_x = (xlo, xhi)`` erects side barriers: every cell with world-x
+    outside ``[xlo, xhi]`` is hard-blocked. This seals the lateral margins
+    between the obstacle field and the workspace bound — the zero-cost "highway"
+    a large ``clearance_weight`` would otherwise route AROUND the field along —
+    forcing the corridor to weave *through* the interior. ``None`` disables it
+    (default).
     """
     x0, x1 = bounds_x
     y0, y1 = bounds_y
@@ -208,6 +216,11 @@ def _find_path(
                 py = y0 + j * grid_res
                 if (px - cx) ** 2 + (py - cy) ** 2 <= clearance ** 2:
                     blocked[i, j] = True
+
+    if wall_x is not None:
+        xlo, xhi = wall_x
+        col_x = x0 + np.arange(nx) * grid_res
+        blocked[(col_x < xlo) | (col_x > xhi), :] = True
 
     def to_cell(p: np.ndarray) -> tuple[int, int]:
         return (int(round((p[0] - x0) / grid_res)),
@@ -267,6 +280,18 @@ def _path_bounds(cfg: SceneConfig) -> tuple[tuple[float, float], tuple[float, fl
     return bounds_x, bounds_y
 
 
+def _field_wall_x(cfg: SceneConfig) -> tuple[float, float] | None:
+    """Side-barrier x-limits (the red field's x-extent) when
+    ``path_wall_field_sides`` is set, else ``None``. Passed to ``_find_path`` as
+    ``wall_x`` to seal the lateral route-around margins. Shared by the initial
+    plan and mid-carry replans so both search the identical walled grid."""
+    if not cfg.path_wall_field_sides:
+        return None
+    cx, _ = cfg.red_field_center
+    half = cfg.red_field_size / 2
+    return (cx - half, cx + half)
+
+
 def plan_carry_path(
     cfg: SceneConfig, red_centers, start_xy, goal_xy,
 ) -> list[np.ndarray] | None:
@@ -294,6 +319,7 @@ def plan_carry_path(
         bounds_x=bounds_x, bounds_y=bounds_y,
         clearance_weight=cfg.path_clearance_weight,
         clearance_pref=cfg.path_clearance_pref,
+        wall_x=_field_wall_x(cfg),
     )
 
 
@@ -351,6 +377,7 @@ def sample_layout(cfg: SceneConfig, rng: np.random.Generator) -> Layout:
             bounds_x=bounds_x, bounds_y=bounds_y,
             clearance_weight=cfg.path_clearance_weight,
             clearance_pref=cfg.path_clearance_pref,
+            wall_x=_field_wall_x(cfg),
         )
         if waypoints is None:
             continue
