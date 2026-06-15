@@ -91,6 +91,31 @@ class ScriptedExpert:
                np.linalg.norm(wps[self._wp_idx] - goal_xy) > dist_cube_goal + 0.02):
             self._wp_idx += 1
 
+    def replan_carry_from_current(self, reds: np.ndarray) -> None:
+        """Plan a FRESH carry corridor by BFS from the cube's CURRENT position to
+        the goal and reset ``_wp_idx`` to 0 on it.
+
+        Called once at the start of a branch-and-relabel ("cleanup") episode
+        (``run_expert_episode(restore_state=...)``): the cube has been restored to
+        an on-policy mid-carry state, so the original spawn→goal ``carry_waypoints``
+        sit *behind* it — tracking them from ``_wp_idx=0`` would drive the arm
+        backward toward the spawn. Re-rooting the corridor at the cube guarantees
+        the expert weaves *forward* from wherever the policy left it, regardless of
+        whether the cube happens to be near or far from the old corridor (so it
+        does not depend on ``_maybe_replan_carry``'s off-path threshold firing).
+        No-op if no clearance-respecting path exists from here (keep the old path;
+        such a branch usually fails the task and is discarded anyway)."""
+        if self.env.layout is None:
+            return
+        cube_xy = self.env.blue_cube_position()[:2]
+        new_path = plan_carry_path(
+            self.env.cfg.scene, np.asarray(reds, dtype=np.float64),
+            cube_xy, self.env.layout.goal_xy,
+        )
+        if new_path:
+            self.env.layout.carry_waypoints = new_path
+            self._wp_idx = 0
+
     def _maybe_replan_carry(self, cube_xy: np.ndarray, reds: np.ndarray) -> None:
         """Re-route the carry corridor if the held cube has drifted off it.
 
