@@ -286,7 +286,7 @@ def parse_args() -> argparse.Namespace:
                    help="scout N uses seed+N; keep ≥ collection N so layouts stay held out")
     p.add_argument("--max-steps", type=int, default=500)
     # ── Gate / anchor knobs ──────────────────────────────────────────────
-    p.add_argument("--gate-margin", type=float, default=0.03,
+    p.add_argument("--gate-margin", type=float, default=0.025,
                    help="near-violation clearance threshold (m): anchor when the grasped "
                         "ee comes within this of a red surface during the weave")
     p.add_argument("--max-anchors", type=int, default=3,
