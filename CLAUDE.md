@@ -217,7 +217,8 @@ tmux new -s dagger_r1     # then, INSIDE the tmux session:
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=$PWD .venv/bin/python \
   -m sim.scripts.train_safe_pi0 \
   --policy.type=safe_pi0 --policy.pretrained_path=lerobot/pi0_base \
-  --policy.safety_weight=1.0 --policy.push_to_hub=false \
+  --policy.safety_weight=1.0 --policy.obstacle_weight=2.0 --policy.ceiling_weight=4.0 \
+  --policy.sdf_margin=0.02 --policy.push_to_hub=false \
   --policy.gradient_checkpointing=true \
   --dataset.repo_id=local/safe-cube-mixed --dataset.root=data/safe_cube_v5 \
   --output_dir=outputs/safe_pi0_bc --batch_size=48 --steps=20000 --save_freq=2000 \
@@ -240,9 +241,17 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=$PWD .venv/bin/pytho
   larger `--steps` (cosine window re-stretches).
 - **LR schedule:** `cosine_decay_with_warmup`, peak `2.5e-5`, **floor `2.5e-6`
   (10% of peak — NOT zero)**. Auto-scales the decay window when `steps < 30000`.
-- **`--policy.safety_weight` (λ) is the central knob — sweep it.** Too small →
-  safety ignored; too large → policy collapses to pure avoidance and stops doing
-  the task.
+- **Safety weighting is split into per-term knobs:** `--policy.obstacle_weight`
+  (lateral collision, default **2.0**) and `--policy.ceiling_weight` (stay-low,
+  default **4.0**), both scaled by the overall `--policy.safety_weight` (λ,
+  default 1.0). **Effective coeffs in the total loss: collision = λ·obstacle_weight
+  = 2.0, ceiling = λ·ceiling_weight = 4.0, flow = 1.0.** `--policy.sdf_margin=0.02`
+  is the clearance buffer. The stronger (2×) collision term is safe on **A*-collected
+  data** because the expert carries at max-available clearance, so the penalty fires
+  mostly off-distribution rather than on the expert (on the old BFS data it would
+  fight the expert's boundary-hugging — see memory). Sweep λ for overall safety
+  strength, or the per-term weights for balance. Too small → safety ignored; too
+  large → policy collapses to pure avoidance and stops doing the task.
 - **Loss is NOT a clean convergence signal** (non-stationary safety term + noisy
   flow-matching). **Early-stop at peak rollout *success*, not at min loss.**
 
@@ -423,7 +432,7 @@ env -u DISPLAY MUJOCO_GL=egl PYTHONPATH=$PWD .venv/bin/python \
   --checkpoint outputs/safe_pi0_bc_v6/checkpoints/last/pretrained_model \
   --dataset-repo-id local/safe-cube-mixed --dataset-root data/safe_cube_v6 \
   --n-red-cubes 8 --max-steps 500 --n-episodes 400 --seed 2000 \
-  --gate-margin 0.03 --max-anchors 3 --n-workers 4 \
+  --gate-margin 0.025 --max-anchors 3 --n-workers 4 \
   --path-clearance-weight 1.0
 
 # then aggregate with the BC set and retrain (serial), as in §2:
