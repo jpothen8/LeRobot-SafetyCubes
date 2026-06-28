@@ -106,17 +106,28 @@ class SceneConfig:
     # that bows the corridor toward the middle of the free gaps — "stay as far
     # from every red as the layout allows", which aligns the expert demos with
     # the policy's safety loss instead of fighting it.
-    #   path_clearance_weight (λ): 0.0 → plain BFS (default, unchanged behavior);
-    #     >0 → A* where stepping at the clearance boundary costs (1+λ)× its
-    #     length, so the planner accepts up to ~λ× extra detour to gain full
-    #     standoff. SWEEP THIS. Too large over-avoids (longer/timid carries,
-    #     routes around tight pairs it could thread) — see CLAUDE.md.
+    #   path_clearance_weight (λ): 0.0 → plain BFS; >0 → clearance-penalised A*
+    #     where stepping at the clearance boundary costs (1+λ)× its length, so
+    #     the planner accepts up to ~λ× extra detour to gain full standoff.
+    #     Default 1.0 (A* enabled) — matches v7+ collection. Set to 0 to restore
+    #     BFS. SWEEP for very tight layouts. Too large over-avoids — see CLAUDE.md.
     #   path_clearance_pref: extra standoff (m) BEYOND path_clearance_radius the
     #     planner tries to keep. The soft penalty ramps from full at the hard
     #     boundary to zero at this distance and saturates there (no incentive to
     #     stray farther → corridors don't get shoved into the workspace walls).
-    path_clearance_weight: float = 0.0
+    #   path_clearance_interior_base / path_clearance_interior_weight: used by
+    #     plan_carry_path (mid-carry replans, DAgger cleanup anchors) to extend
+    #     the soft penalty *inside* the clearance radius without hard-blocking.
+    #     The repulse field inside the radius is a linear ramp:
+    #       repulse(d) = base + (peak − base) × (1 − d / clearance_radius)
+    #     → base at the boundary (d = clearance_radius), peak at cube centres.
+    #     Outside the radius the field is IDENTICAL to the standard EDT field.
+    #     sample_layout ignores these (always uses the hard-block); only
+    #     plan_carry_path / replan_carry_from_current use the smooth interior.
+    path_clearance_weight: float = 1.0
     path_clearance_pref: float = 0.04
+    path_clearance_interior_base: float = 5.0
+    path_clearance_interior_weight: float = 11.0
     # Side barriers: when True, hard-block the lateral margins outside the red
     # field's x-extent (the route the cost-field A* would otherwise detour
     # AROUND the field along when path_clearance_weight is large). Forces the

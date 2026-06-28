@@ -112,33 +112,30 @@ def _bfs_parents(
 def _astar_parents(
     blocked: np.ndarray, src: tuple[int, int], dst: tuple[int, int], *,
     grid_res: float, clearance_weight: float, clearance_pref: float,
+    repulse_field: np.ndarray | None = None,
 ) -> dict[tuple[int, int], tuple[int, int]] | None:
-    """Clearance-penalized A* → parent map. Same hard ``blocked`` constraint as
-    :func:`_bfs_parents` (so finger safety is still guaranteed), but each step
-    into a cell within ``clearance_pref`` metres of the blocked region pays an
-    extra cost of up to ``clearance_weight``× its length. The optimal route
-    therefore bows toward the *middle* of the free corridors instead of grazing
-    the clearance boundary — the "stay as far from every red as the gap allows"
-    path the BFS can't express.
+    """Clearance-penalized A* → parent map. Each step into a cell within
+    ``clearance_pref`` metres of the blocked region pays an extra cost of up to
+    ``clearance_weight``× its length, bowing the route toward gap centres.
 
-    Cost field comes from the Euclidean distance transform of the free space
-    (distance, in metres, from each free cell to the nearest blocked cell —
-    ``blocked`` already bakes in the hard clearance radius, so this measures the
-    *extra* standoff beyond it). The penalty saturates at ``clearance_pref``: a
-    cell that far out (or farther) is free, so there is no reward for straying
-    even farther → the path doesn't get shoved into the workspace walls.
+    When ``repulse_field`` is provided (a precomputed (nx, ny) float array) it
+    is used directly instead of the EDT.  :func:`_find_path` supplies this in
+    smooth-interior mode so the search can start from positions inside the old
+    hard-clearance radius without returning ``None``.
 
-    Heuristic is straight-line distance to ``dst``; since every edge costs at
-    least its geometric length, the heuristic never overestimates → the search
-    stays admissible/consistent and the returned path is cost-optimal. Returns
-    ``None`` if ``dst`` is unreachable from ``src``."""
+    Heuristic is straight-line distance to ``dst``; admissible → cost-optimal.
+    Returns ``None`` if ``dst`` is unreachable from ``src``."""
     nx, ny = blocked.shape
-    edt = distance_transform_edt(~blocked) * grid_res
-    inv_pref = 1.0 / clearance_pref if clearance_pref > 0 else 0.0
+    if repulse_field is not None:
+        def repulse(cell: tuple[int, int]) -> float:
+            return float(repulse_field[cell])
+    else:
+        edt = distance_transform_edt(~blocked) * grid_res
+        inv_pref = 1.0 / clearance_pref if clearance_pref > 0 else 0.0
 
-    def repulse(cell: tuple[int, int]) -> float:
-        # 1 at the clearance boundary, ramping linearly to 0 at clearance_pref.
-        return max(0.0, 1.0 - edt[cell] * inv_pref)
+        def repulse(cell: tuple[int, int]) -> float:
+            # 1 at the clearance boundary, ramping linearly to 0 at clearance_pref.
+            return max(0.0, 1.0 - edt[cell] * inv_pref)
 
     def heuristic(cell: tuple[int, int]) -> float:
         return grid_res * math.hypot(cell[0] - dst[0], cell[1] - dst[1])
@@ -177,45 +174,61 @@ def _find_path(
     waypoint_stride: int = 3,
     clearance_weight: float = 0.0, clearance_pref: float = 0.0,
     wall_x: tuple[float, float] | None = None,
+    clearance_interior_weight: float = 0.0,
+    clearance_interior_base: float = 0.0,
 ) -> list[np.ndarray] | None:
-    """Plan a 2D grid path of (x, y) world-frame waypoints leading blue→goal
-    while staying ≥ `clearance` from every red cube center, or `None` if no such
-    path exists. Waypoints are downsampled every `waypoint_stride` cells;
-    goal_xy is always the final waypoint.
+    """Plan a 2D grid path of (x, y) world-frame waypoints leading blue→goal.
+    Waypoints are downsampled every ``waypoint_stride`` cells; goal_xy is always
+    the final waypoint.
 
-    Search mode (the hard clearance constraint is identical either way):
-      * ``clearance_weight <= 0`` (default) → plain BFS shortest path, which
-        hugs the clearance boundary (:func:`_bfs_parents`).
-      * ``clearance_weight > 0`` → clearance-penalized A* that prefers the
-        middle of the free corridors, staying up to ``clearance_pref`` metres
-        clear where the geometry allows (:func:`_astar_parents`).
+    Search mode:
+      * ``clearance_weight <= 0`` → plain BFS shortest path (hard ``clearance``
+        disks block cells within the radius of each red centre).
+      * ``clearance_weight > 0``, ``clearance_interior_weight <= 0`` → A* with
+        EDT-based soft clearance penalty and the same hard ``clearance`` disks.
+      * ``clearance_weight > 0``, ``clearance_interior_weight > 0`` → **smooth-
+        interior A***: no hard-blocked cells from the clearance radius; instead
+        a precomputed repulse field extends the soft penalty *inside* the old
+        no-go zone.  The field is:
 
-    ``wall_x = (xlo, xhi)`` erects side barriers: every cell with world-x
-    outside ``[xlo, xhi]`` is hard-blocked. This seals the lateral margins
-    between the obstacle field and the workspace bound — the zero-cost "highway"
-    a large ``clearance_weight`` would otherwise route AROUND the field along —
-    forcing the corridor to weave *through* the interior. ``None`` disables it
-    (default).
+            d ≥ r+p  →  0
+            r ≤ d < r+p  →  1 − (d−r)/p          (existing soft ramp, 0→1)
+            0 ≤ d < r    →  1 + iw·(1 − d/r)     (inside: 1 at boundary, 1+iw at centre)
+
+        where ``r = clearance``, ``p = clearance_pref``, ``iw =
+        clearance_interior_weight``.  Outside the old radius the cost field is
+        **identical** to the EDT-based one, so routing is unchanged for paths
+        that start in the safe zone.  Inside, the cost rises steeply toward red
+        centres — deterring routing through cube bodies — but any real robot
+        position can be a valid start without the search returning ``None``.
+
+    ``wall_x = (xlo, xhi)`` erects side barriers (hard-blocked regardless of
+    mode).  ``None`` disables it (default).
     """
     x0, x1 = bounds_x
     y0, y1 = bounds_y
     nx = int(np.ceil((x1 - x0) / grid_res)) + 1
     ny = int(np.ceil((y1 - y0) / grid_res)) + 1
 
+    # Smooth-interior mode: clearance disks are NOT hard-blocked; the repulse
+    # field handles cost inside them.  Only wall_x remains a hard constraint.
+    smooth_interior = clearance_weight > 0.0 and clearance_interior_weight > 0.0
+
     blocked = np.zeros((nx, ny), dtype=bool)
-    for cx, cy in reds:
-        i_lo = max(0, int(np.floor((cx - clearance - x0) / grid_res)))
-        i_hi = min(nx - 1, int(np.ceil((cx + clearance - x0) / grid_res)))
-        j_lo = max(0, int(np.floor((cy - clearance - y0) / grid_res)))
-        j_hi = min(ny - 1, int(np.ceil((cy + clearance - y0) / grid_res)))
-        for i in range(i_lo, i_hi + 1):
-            for j in range(j_lo, j_hi + 1):
-                if blocked[i, j]:
-                    continue
-                px = x0 + i * grid_res
-                py = y0 + j * grid_res
-                if (px - cx) ** 2 + (py - cy) ** 2 <= clearance ** 2:
-                    blocked[i, j] = True
+    if not smooth_interior:
+        for cx, cy in reds:
+            i_lo = max(0, int(np.floor((cx - clearance - x0) / grid_res)))
+            i_hi = min(nx - 1, int(np.ceil((cx + clearance - x0) / grid_res)))
+            j_lo = max(0, int(np.floor((cy - clearance - y0) / grid_res)))
+            j_hi = min(ny - 1, int(np.ceil((cy + clearance - y0) / grid_res)))
+            for i in range(i_lo, i_hi + 1):
+                for j in range(j_lo, j_hi + 1):
+                    if blocked[i, j]:
+                        continue
+                    px = x0 + i * grid_res
+                    py = y0 + j * grid_res
+                    if (px - cx) ** 2 + (py - cy) ** 2 <= clearance ** 2:
+                        blocked[i, j] = True
 
     if wall_x is not None:
         xlo, xhi = wall_x
@@ -236,10 +249,32 @@ def _find_path(
         return None
 
     if clearance_weight > 0.0:
-        parent = _astar_parents(
-            blocked, src, dst, grid_res=grid_res,
-            clearance_weight=clearance_weight, clearance_pref=clearance_pref,
-        )
+        if smooth_interior:
+            # Vectorised per-cell distance to the nearest red centre.
+            px_grid = x0 + np.arange(nx, dtype=np.float64)[:, None] * grid_res
+            py_grid = y0 + np.arange(ny, dtype=np.float64)[None, :] * grid_res
+            min_dist = np.full((nx, ny), np.inf)
+            for cx, cy in reds:
+                np.minimum(min_dist, np.hypot(px_grid - cx, py_grid - cy),
+                           out=min_dist)
+            # Outside zone (d >= clearance): identical to EDT-based formula.
+            inv_pref = 1.0 / clearance_pref if clearance_pref > 0 else 0.0
+            outside = min_dist >= clearance
+            rep_out = np.maximum(0.0, 1.0 - (min_dist - clearance) * inv_pref)
+            # Inside zone (d < clearance): base at boundary, peak at cube centre.
+            t = np.where(outside, 0.0, 1.0 - min_dist / clearance)
+            rep_in = clearance_interior_base + (clearance_interior_weight - clearance_interior_base) * t
+            repulse_field: np.ndarray | None = np.where(outside, rep_out, rep_in)
+            parent = _astar_parents(
+                blocked, src, dst, grid_res=grid_res,
+                clearance_weight=clearance_weight, clearance_pref=clearance_pref,
+                repulse_field=repulse_field,
+            )
+        else:
+            parent = _astar_parents(
+                blocked, src, dst, grid_res=grid_res,
+                clearance_weight=clearance_weight, clearance_pref=clearance_pref,
+            )
     else:
         parent = _bfs_parents(blocked, src, dst)
     if parent is None:
@@ -295,19 +330,16 @@ def _field_wall_x(cfg: SceneConfig) -> tuple[float, float] | None:
 def plan_carry_path(
     cfg: SceneConfig, red_centers, start_xy, goal_xy,
 ) -> list[np.ndarray] | None:
-    """Replan a collision-free carry corridor from an ARBITRARY start XY to the
-    goal, reusing the same BFS / clearance / grid / bounds as the initial layout
-    plan.
+    """Replan a carry corridor from an ARBITRARY start XY to the goal.
 
-    Returns blue→goal XY waypoints kept ≥ ``path_clearance_radius`` from every
-    red-cube center, or ``None`` if no clearance-respecting path exists from
-    ``start_xy`` (e.g. the start already sits inside a red's clearance disk).
+    Uses smooth-interior A* (``path_clearance_interior_weight > 0``): no
+    hard-blocked clearance disks, so this never returns ``None`` for any real
+    robot position (including DAgger cleanup anchors that sit inside the old
+    hard-clearance zone).  Outside the clearance radius the cost field is
+    identical to the standard EDT-based one; inside it, cost rises steeply
+    toward cube centres, deterring routes through obstacle bodies.
 
-    The expert calls this to re-route after the policy has dragged the held cube
-    off the original spawn→goal corridor during DAgger mixing: the relabel then
-    follows a valid route from where the cube actually is, not a drive back
-    across the field to a stale corridor. ``red_centers`` may be (n, 2) or
-    (n, 3) — only the XY columns are used."""
+    ``red_centers`` may be (n, 2) or (n, 3) — only XY columns are used."""
     reds = [np.asarray(c, dtype=np.float64)[:2] for c in np.asarray(red_centers)]
     bounds_x, bounds_y = _path_bounds(cfg)
     return _find_path(
@@ -320,6 +352,8 @@ def plan_carry_path(
         clearance_weight=cfg.path_clearance_weight,
         clearance_pref=cfg.path_clearance_pref,
         wall_x=_field_wall_x(cfg),
+        clearance_interior_weight=cfg.path_clearance_interior_weight,
+        clearance_interior_base=cfg.path_clearance_interior_base,
     )
 
 

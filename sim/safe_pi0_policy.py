@@ -110,21 +110,16 @@ class SafePI0Config(PI0Config):
     knob — sweep it first.
     """
 
-    # Action chunk length. Shorter chunks re-plan more often, which matters for
-    # recovery: a 30-step chunk at ~10 Hz ≈ 3 s — enough for a full grasp or a
-    # weave correction while still being much shorter than a full carry (~10 s).
-    chunk_size: int = 30
-    n_action_steps: int = 30
+    chunk_size: int = 50
+    n_action_steps: int = 50
 
     # Safety loss weighting and shape. ``safety_weight`` (λ) is the OVERALL safety
     # multiplier; ``obstacle_weight`` / ``ceiling_weight`` set the balance between
     # the lateral-clearance and stay-low terms. Effective coeffs in the total loss:
     #   collision = λ·obstacle_weight,  ceiling = λ·ceiling_weight,  flow = 1.0.
-    # Current default = collision 2.0 (1·2), ceiling 4.0 (1·4). The stronger
-    # collision term is safe because the A* expert carries at max-available
-    # clearance (see CLAUDE.md / memory), so it fires mostly off-distribution.
+    # Default = collision 1.0 (1·1), ceiling 4.0 (1·4).
     safety_weight: float = 1.0            # λ — overall task vs. safety trade-off
-    obstacle_weight: float = 2.0          # weight of the lateral-clearance term within L_safety
+    obstacle_weight: float = 1.0          # weight of the lateral-clearance term within L_safety
     sdf_alpha: float = 50.0               # sigmoid sharpness (1/m)
     sdf_margin: float = 0.02              # desired clearance buffer (m)
     ee_radius: float = 0.03               # gripper bounding-sphere radius (m)

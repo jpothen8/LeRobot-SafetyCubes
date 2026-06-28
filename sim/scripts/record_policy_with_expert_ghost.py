@@ -17,10 +17,19 @@ Each frame the agentview is composited as::
 
     policy frame (the real arm)
     + tinted silhouette of the expert env's arm
-    + 2-D BFS carry-path drawn on the table plane
+    + 2-D expert carry-path drawn on the table plane
 
 The expert arm silhouette is extracted via MuJoCo **segmentation rendering** of
 the expert env (mask = its arm geoms), then alpha-blended onto the policy frame.
+
+**The drawn carry-path tracks the POLICY, not the ghost arm.** It starts as the
+spawn→goal corridor but is **re-rooted at the policy's cube whenever the policy
+carries it off the corridor** by more than the expert's own
+``replan_offpath_threshold`` — the same mid-carry replan the scripted expert does
+internally (``_maybe_replan_carry``), using the live red positions. So the overlay
+always shows the safe route the expert *would* take from where the policy actually
+is, instead of a stale plan the policy has already left. Its traversed/ahead
+colouring is driven by the policy's own progress (grasp + cube→goal distance).
 
 The ghost is a **pure visualization artifact**:
   * It lives only in the *output video*. The policy's observations come from the
@@ -34,13 +43,14 @@ The episode length is driven by the **policy** episode (so the video matches a
 plain policy rollout); if the expert finishes first its arm freezes at the final
 pose, if the policy finishes first the expert is simply cut off.
 
-Example (reproduces the bc_v6_20k_chunked layouts, with the ghost)::
+Example (bc_v7 model with A* corridor overlay)::
 
     env -u DISPLAY MUJOCO_GL=egl PYTHONPATH=$PWD .venv/bin/python \\
         -m sim.scripts.record_policy_with_expert_ghost \\
-        --checkpoint outputs/safe_pi0_bc_v6/checkpoints/last/pretrained_model \\
-        --dataset-repo-id local/safe-cube-mixed --dataset-root data/safe_cube_v6 \\
-        --out videos/bc_v6_20k_ghost.mp4 --n-episodes 8 --seed 2000 --action-chunking
+        --checkpoint outputs/safe_pi0_bc_v7/checkpoints/last/pretrained_model \\
+        --dataset-repo-id local/safe-cube-mixed --dataset-root data/safe_cube_v7 \\
+        --out videos/bc_v7_ghost.mp4 --n-episodes 8 --seed 2000 --action-chunking \\
+        --path-clearance-weight 1.0
 """
 
 from __future__ import annotations
@@ -58,6 +68,7 @@ from sim.dagger import PolicyRollout
 from sim.env import SafeCubeEnv
 from sim.expert import ScriptedExpert
 from sim.scene import plan_carry_path
+
 from sim.scripts.collect_demos import TASK_DESCRIPTION
 
 # Ghost colour (RGB). Frames are RGB until written, so specify in RGB. A bright
@@ -263,6 +274,9 @@ def main() -> None:
     ghost_env = SafeCubeEnv(EnvConfig(scene=scene, max_episode_steps=args.max_steps, seed=args.seed))
     expert = ScriptedExpert(env=ghost_env, cfg=ExpertConfig())
     grip_open = ExpertConfig().grip_open
+    # Off-corridor threshold for re-rooting the DRAWN path at the policy's cube
+    # (the expert's own replan_offpath_threshold) — see the per-step replan below.
+    replan_thr = expert.cfg.replan_offpath_threshold
 
     policy = PolicyRollout(
         checkpoint=args.checkpoint,
@@ -289,8 +303,6 @@ def main() -> None:
         expert.reset()
         arm_ids = np.fromiter(ghost_env._arm_geom_ids, dtype=np.int64)
 
-        # BFS path for the policy's actual trajectory — replanned when the
-        # policy carries the cube off the original corridor.
         policy_carry_wps: list[tuple[float, float]] = list(env.layout.carry_waypoints or [])
         policy_wp_idx: int = 0
 
@@ -307,8 +319,7 @@ def main() -> None:
         ghost_viz = mujoco.Renderer(ghost_env.model, height=H, width=W)
 
         # Pre-compute camera intrinsics/extrinsics for this episode.  The
-        # agentview camera is fixed (not body-attached), so these are constant;
-        # waypoint projection itself is done per-step so replans are reflected.
+        # agentview camera is fixed (not body-attached), so these are constant.
         mujoco.mj_forward(ghost_env.model, ghost_env.data)
         cam_id = mujoco.mj_name2id(ghost_env.model, mujoco.mjtObj.mjOBJ_CAMERA,
                                     scene.camera_name)
@@ -330,25 +341,31 @@ def main() -> None:
             action = policy.act_queued(obs, args.task) if args.action_chunking else policy.act(obs, args.task)
             obs, _, terminated, truncated, info = env.step(action)
 
-            # --- BFS path replan based on policy's actual cube position ---
+            # Keep the DRAWN expert corridor live: re-root it at the policy's cube
+            # whenever the policy carries the cube off the current corridor by more
+            # than the expert's own off-path threshold (replan_offpath_threshold) —
+            # the same replan the scripted expert does internally. So the overlay
+            # always shows the safe route the expert WOULD take from where the policy
+            # actually is, never a stale spawn->goal plan it has already left. Uses
+            # the live red positions (the policy may have nudged cubes).
             if info["grasped"] and policy_carry_wps:
                 blue_xy = np.asarray(info["blue_cube_pos"][:2], dtype=np.float64)
-                wps_arr = np.asarray(policy_carry_wps, dtype=np.float64)
-                # Advance wp_idx past waypoints the cube has already reached.
                 goal_xy = np.asarray(info["goal_pos"][:2], dtype=np.float64)
+                if replan_thr > 0:
+                    closest = min(float(np.linalg.norm(np.asarray(wp) - blue_xy))
+                                  for wp in policy_carry_wps)
+                    if closest > replan_thr:
+                        new_path = plan_carry_path(scene, info["cube_positions"],
+                                                   blue_xy, goal_xy)
+                        if new_path:
+                            policy_carry_wps = [(float(p[0]), float(p[1])) for p in new_path]
+                            policy_wp_idx = 0
+                # Advance wp_idx past waypoints the policy's cube has already passed.
                 dist_cube_goal = float(np.linalg.norm(blue_xy - goal_xy))
                 while (policy_wp_idx < len(policy_carry_wps) - 1 and
                        np.linalg.norm(np.asarray(policy_carry_wps[policy_wp_idx]) - goal_xy)
                        > dist_cube_goal + 0.02):
                     policy_wp_idx += 1
-                # Replan if the cube has drifted off the corridor.
-                closest_dist = float(np.linalg.norm(wps_arr - blue_xy, axis=1).min())
-                if closest_dist > ExpertConfig().replan_offpath_threshold:
-                    reds = np.asarray(info["cube_positions"], dtype=np.float64).reshape(-1, 3)
-                    new_path = plan_carry_path(scene, reds, blue_xy, goal_xy)
-                    if new_path:
-                        policy_carry_wps = new_path
-                        policy_wp_idx = 0
 
             # --- expert ghost env (lockstep, independent physics) ---
             if not expert_frozen:
@@ -380,16 +397,24 @@ def main() -> None:
             agent_ghosted = _composite_ghost(agent_frame, expert_seg, expert_rgb,
                                               arm_ids, args.ghost_alpha)
 
-            # BFS path overlay — tracks the policy's actual blue cube position and
-            # replans when it drifts off the original corridor (policy_carry_wps above).
             projected_wps = [
                 _project_point(cam_pos, cam_mat, f_px, H, W,
                                np.array([wx, wy, path_z]))
                 for (wx, wy) in policy_carry_wps
             ]
             g_phase = "DONE" if (expert_frozen or expert.done()) else expert._phase.name
+            # Colour the (policy-following) corridor by the POLICY's own progress,
+            # not the independent ghost arm's phase: CARRY while the policy holds the
+            # cube, DONE once it has placed it near the goal, APPROACH before grasp.
+            if info["grasped"]:
+                path_phase = "CARRY"
+            elif float(np.linalg.norm(np.asarray(info["blue_cube_pos"][:2]) -
+                                      np.asarray(info["goal_pos"][:2]))) < 0.08:
+                path_phase = "DONE"
+            else:
+                path_phase = "APPROACH"
             agent_ghosted = _draw_bfs_path(agent_ghosted, projected_wps,
-                                            g_phase, policy_wp_idx)
+                                            path_phase, policy_wp_idx)
 
             # BFS path on the wrist view.  The wrist camera is body-attached so
             # its pose (cam_xpos/cam_xmat) is read from env.data every step.
@@ -403,7 +428,7 @@ def main() -> None:
                 for (wx, wy) in policy_carry_wps
             ]
             wrist_frame = _draw_bfs_path(wrist_frame, wrist_projected_wps,
-                                         g_phase, policy_wp_idx)
+                                         path_phase, policy_wp_idx)
 
             stats = info["stats"]
             ee = info["ee_pos"]

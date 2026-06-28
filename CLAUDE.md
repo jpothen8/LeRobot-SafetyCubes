@@ -272,6 +272,19 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=$PWD .venv/bin/pytho
   rates; wrap a checkpoint with `sim.dagger.PolicyRollout` and pass `.act_queued`
   with a per-episode `policy.reset()`.
 - `sim/scripts/record_rollout.py` — scripted-expert demo (the `videos/demo*` trio).
+- `sim/scripts/viz_cleanup_astar.py` — render stored cleanup-DAgger episodes from a
+  dataset with the **A* carry path projected onto the agentview frame**. Reads
+  `privileged.cube_positions`/`blue_cube_pos`/`goal_pos` from the parquet, re-plans
+  the A* path (λ=1.0, smooth-interior) from the episode's first frame, and overlays
+  it per-frame on the decoded video (yellow = ahead, olive = done, orange = current
+  target). Output is composite 960×480 (agentview + wrist). Cleanup v7.1 used λ=1.0
+  with smooth-interior (`path_clearance_interior_weight=11`, base=5).
+  ```bash
+  env -u DISPLAY MUJOCO_GL=egl PYTHONPATH=$PWD .venv/bin/python \
+    -m sim.scripts.viz_cleanup_astar \
+    --root data/safe_cube_cleanup_v7.1 --out videos/cleanup_v7.1_astar.mp4 \
+    --n-episodes 8
+  ```
 - All of these RENDER → run with `env -u DISPLAY MUJOCO_GL=egl`, and verify
   non-black.
 
@@ -420,6 +433,22 @@ marks the anchor frame (not part of this spec).
   (default on), `--path-clearance-weight` (A* λ, default 1.0), `--path-wall-field-sides`,
   plus the usual `--checkpoint / --dataset-repo-id / --dataset-root /
   --repo-id / --root / --n-red-cubes / --max-steps / --seed / --n-workers / --vcodec`.
+- **`--anchor-mode {weave,place,both}`** (default `weave`, branch
+  `placement-anchor-dagger`). **`place`** is a second gate that fixes the **open-loop
+  placement undershoot** (the v7.1 policy drops the cube ~18 mm off-center, biased
+  toward the arm base — see `outputs/quantify_place_bias.log`). It anchors each
+  grasped *placement attempt* (cube within `--place-approach-radius`, default 0.10 m,
+  of the goal, off-center beyond `--place-tol`, default 0.015 m) at the most recent
+  grasped planning boundary — captured at **every** grasped re-plan, NOT
+  distance-gated (the placing chunk often originates outside the approach radius) —
+  and the pure expert relabels a **centered** drop (`DESCEND2` to within 7.5 mm).
+  Yield ≈1.3 clean branches/scout; branches are **short** (≈30–100 frames) → use
+  **`--vcodec libsvtav1`** (`h264_nvenc` can fail to emit a file on the shortest
+  clips). Staged scripts: `outputs/run_place_cleanup.sh` (collect 800 branches,
+  seeds 4000+, from the v7.1 ckpt) → `outputs/run_train_place.sh` (aggregate
+  `safe_cube_agg_v7.1` + `safe_cube_place_cleanup` → `safe_cube_agg_place`, fine-tune
+  from the v7.1 cleanup ckpt at lr 1e-5 → `outputs/safe_pi0_place`). Early-stop on
+  rollout success **and** re-measured placement bias (`quantify_place_bias.py`).
 
 **Intended command** (held-out seeds ≥ collection N; `--dataset-*` = the BC set the
 checkpoint was trained on, for norm stats; `--repo-id/--root` = where the new
