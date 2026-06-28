@@ -442,9 +442,15 @@ marks the anchor frame (not part of this spec).
   grasped planning boundary — captured at **every** grasped re-plan, NOT
   distance-gated (the placing chunk often originates outside the approach radius) —
   and the pure expert relabels a **centered** drop (`DESCEND2` to within 7.5 mm).
-  Yield ≈1.3 clean branches/scout; branches are **short** (≈30–100 frames) → use
-  **`--vcodec libsvtav1`** (`h264_nvenc` can fail to emit a file on the shortest
-  clips). Staged scripts: `outputs/run_place_cleanup.sh` (collect 800 branches,
+  Yield ≈1.3 clean branches/scout; branches are **short** (≈30–100 frames), and
+  `h264_nvenc` can fail to emit a file on the shortest clips → encode with
+  **SOFTWARE h264: `--vcodec h264 --gop 4`**. libx264 is robust on short clips,
+  and `--gop 4` makes the metadata (h264, g=4, crf=30, preset=None) an **exact
+  match to the `h264_nvenc`-collected BC set** so `aggregate_datasets` accepts it.
+  **Do NOT use `--vcodec libsvtav1` here** — it survives short clips but yields
+  **av1 g=2**, which fails `aggregate_datasets`' video-metadata equality check
+  against the h264 BC set (`validate_all_metadata: Same features is expected`).
+  Staged scripts: `outputs/run_place_cleanup.sh` (collect 800 branches,
   seeds 4000+, from the v7.1 ckpt) → `outputs/run_train_place.sh` (aggregate
   `safe_cube_agg_v7.1` + `safe_cube_place_cleanup` → `safe_cube_agg_place`, fine-tune
   from the v7.1 cleanup ckpt at lr 1e-5 → `outputs/safe_pi0_place`). Early-stop on
