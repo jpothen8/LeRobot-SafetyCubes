@@ -248,7 +248,12 @@ def _collect_block(payload: dict) -> dict:
         repo_id=payload["repo_id"], root=payload["root"], n_red_cubes=payload["n_red"],
         image_size=scene.image_size, action_dim=env.action_dim, state_dim=state_dim,
         fps=env.cfg.fps, use_videos=True,
-        camera_encoder=VideoEncoderConfig(vcodec=payload["vcodec"]),
+        # gop=None → VideoEncoderConfig default g (2; h264_nvenc auto-clamps to 4).
+        # Set --gop 4 with --vcodec h264 so software h264 matches an h264_nvenc BC
+        # set's metadata for aggregation.
+        camera_encoder=(VideoEncoderConfig(vcodec=payload["vcodec"], g=payload["gop"])
+                        if payload.get("gop") is not None
+                        else VideoEncoderConfig(vcodec=payload["vcodec"])),
         track_actor=False,
     )
     expert = ScriptedExpert(env=env, cfg=ExpertConfig())
@@ -392,9 +397,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vcodec", type=str, default="auto",
                    help="'auto' → first available HW encoder (h264_nvenc on NVIDIA), "
                         "else 'libsvtav1' software. Pass an explicit codec to force it. "
-                        "NOTE: --anchor-mode place branches are SHORT (~30-100 frames); "
-                        "h264_nvenc can fail to emit a file on the shortest clips — use "
-                        "'libsvtav1' for place mode.")
+                        "NOTE: --anchor-mode place branches are SHORT (~30-100 frames) and "
+                        "h264_nvenc can fail to emit a file on the shortest clips. For place "
+                        "mode use SOFTWARE h264 ('--vcodec h264 --gop 4'): libx264 is robust "
+                        "on short clips AND matches the h264_nvenc-collected BC set's video "
+                        "metadata (h264, g=4) so the cleanup set aggregates with it. "
+                        "('libsvtav1' also survives short clips but yields av1 g=2, which will "
+                        "NOT aggregate with an h264 BC set.)")
+    p.add_argument("--gop", type=int, default=None,
+                   help="override the encoder GOP size (keyframe interval). Leave unset for "
+                        "the VideoEncoderConfig default (g=2, which h264_nvenc auto-clamps to "
+                        "4). Set --gop 4 with '--vcodec h264' so software h264 matches an "
+                        "h264_nvenc BC set (which is g=4) for aggregation.")
     p.add_argument("--keep-shards", action="store_true",
                    help="don't delete the per-worker shard datasets after merge")
     # ── A* corridor planner (used by the expert in each branch) ─────────────
@@ -446,7 +460,7 @@ def main() -> None:
             branch_cap=args.branch_cap, successes_only=args.successes_only,
             min_branch_frames=args.min_branch_frames,
             target_branches=per_worker_target,
-            vcodec=args.vcodec,
+            vcodec=args.vcodec, gop=args.gop,
             path_clearance_weight=args.path_clearance_weight,
             path_clearance_pref=args.path_clearance_pref,
             path_wall_field_sides=args.path_wall_field_sides,
@@ -465,7 +479,7 @@ def main() -> None:
                 else f"gate_margin={args.gate_margin},place_tol={args.place_tol}")
     print(f"Launching {len(payloads)} workers × {target_msg}  "
           f"(anchor_mode={args.anchor_mode}, {gate_msg}, max_anchors={args.max_anchors}, "
-          f"vcodec={args.vcodec}, n_red={args.n_red_cubes}, "
+          f"vcodec={args.vcodec}, gop={args.gop}, n_red={args.n_red_cubes}, "
           f"successes_only={args.successes_only})\n"
           f"  policy={args.checkpoint}\n"
           f"  stats from={args.dataset_repo_id} (root={args.dataset_root})", flush=True)
