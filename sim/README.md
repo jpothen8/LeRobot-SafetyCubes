@@ -155,6 +155,15 @@ task. The evolving safety term makes the loss landscape non-stationary, so
 **early-stop at peak rollout success, not at min loss.** Checkpoint lands at
 `outputs/safe_pi0_bc/checkpoints/last/pretrained_model`.
 
+There is a **second policy class**, `safe_diffusion` (`sim/safe_diffusion_policy.py`,
+`sim/scripts/train_safe_diffusion.py`): the identical safety loss on a Diffusion
+Policy backbone instead of π0. It shares this file's `privileged.*` contract and
+the `sim/safety_geometry.py` primitives verbatim, and swaps the flow-matching
+endpoint estimate for the DDPM one. Orders of magnitude cheaper per step, so it
+is the practical way to actually sweep λ. See **CLAUDE.md §2b** for the live
+recipe and its gotchas (MIN_MAX vs MEAN_STD action normalization; `n_obs_steps=1`
+is load-bearing for DAgger).
+
 ### 3. DAgger (collect on the policy's own state distribution → retrain)
 
 `sim/scripts/dagger.py` runs the full collect→retrain loop. Round 0 is pure

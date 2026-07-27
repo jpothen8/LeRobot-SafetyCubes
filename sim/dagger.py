@@ -2,7 +2,8 @@
 
 Two reusable pieces:
 
-* :class:`PolicyRollout` — wraps a trained (Safe)PI0 checkpoint behind a simple
+* :class:`PolicyRollout` — wraps a trained ``safe_pi0`` **or** ``safe_diffusion``
+  checkpoint behind a simple
   ``act(obs, task) -> np.ndarray`` interface, mirroring LeRobot's eval-time
   inference path (preprocessor → ``select_action`` → postprocessor). Also usable
   as the ``policy`` argument to :func:`sim.evaluate.evaluate`.
@@ -23,7 +24,14 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-import sim.safe_pi0_policy  # noqa: F401  -- registers `safe_pi0` with draccus
+# Side effect: register both project policy classes with draccus, so
+# `PreTrainedConfig.from_pretrained(checkpoint)` below resolves a checkpoint of
+# either type. Everything downstream (make_policy, make_pre_post_processors,
+# select_action) is policy-agnostic, so PolicyRollout — and therefore
+# sim/scripts/benchmark_policy.py, record_policy_rollout.py and the cleanup-DAgger
+# collector — works unchanged for both.
+import sim.safe_diffusion_policy  # noqa: F401  -- registers `safe_diffusion`
+import sim.safe_pi0_policy  # noqa: F401  -- registers `safe_pi0`
 from sim.env import SafeCubeEnv
 from sim.expert import ScriptedExpert
 from sim.recorder import EpisodeRecorder

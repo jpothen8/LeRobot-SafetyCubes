@@ -255,6 +255,77 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=$PWD .venv/bin/pytho
 - **Loss is NOT a clean convergence signal** (non-stationary safety term + noisy
   flow-matching). **Early-stop at peak rollout *success*, not at min loss.**
 
+### 2b. `safe_diffusion` — the second policy class (branch `safe-diffusion-policy`)
+
+`sim/safe_diffusion_policy.py` applies the **same safety loss to a Diffusion
+Policy** (Chi et al.) backbone instead of π0: `L = L_diffusion + λ·L_safety`,
+same `sim/safety_geometry.py` FK → box-SDF → clearance chain, same `privileged.*`
+loss-only contract, same coefficient names and defaults.
+
+**Why it exists: iteration speed.** π0 is ~5 s/step at batch 48 (~21 h/run),
+which is why λ — "the central knob, sweep it first" — has never actually been
+swept. `safe_diffusion` is 274 M params and measured **~0.03 s/step at batch 4**
+on this box, with ~1 GB checkpoints instead of 22 GB. It's the cheap vehicle for
+sweeping `safety_weight` / `obstacle_weight` / `ceiling_weight` / `sdf_margin`,
+and it adds an architecture axis to the ablation table (*the safety loss works
+across generative policy classes*). The trade: no internet-pretrained VLA prior,
+no language conditioning, trains **from scratch** — expect a lower absolute
+ceiling than π0 and read cross-class numbers as trends, not interchangeable.
+
+```bash
+uv pip install --python .venv/bin/python "diffusers>=0.27.2,<0.36.0"   # one-time
+
+tmux new -s diff_bc     # then, INSIDE tmux:
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=$PWD .venv/bin/python \
+  -m sim.scripts.train_safe_diffusion \
+  --policy.type=safe_diffusion --policy.push_to_hub=false \
+  --policy.safety_weight=1.0 --policy.obstacle_weight=2.0 --policy.ceiling_weight=4.0 \
+  --policy.sdf_margin=0.02 \
+  --dataset.repo_id=local/safe-cube-mixed --dataset.root=data/safe_cube_agg_v7.1 \
+  --output_dir=outputs/safe_diffusion_bc --batch_size=64 --steps=100000 --save_freq=10000 \
+  --wandb.enable=true --wandb.disable_artifact=true --wandb.project=safe-cube \
+  2>&1 | tee outputs/diffusion_bc_train.log
+```
+
+- **No `--policy.pretrained_path`** — there is no `pi0_base` analogue; only the
+  ResNet18 backbone is ImageNet-initialized. Budget many more *steps* at a tiny
+  fraction of the wall clock. Early-stop on rollout **success**, same as §2.
+- **Everything downstream is policy-agnostic and works unchanged**: `PolicyRollout`
+  registers both classes, so `benchmark_policy.py`, `record_policy_rollout.py` and
+  the cleanup-DAgger collector take a `safe_diffusion` checkpoint as-is (verified
+  end-to-end).
+- **Chunking defaults are set for PARITY with π0** (`n_action_steps=50`, executed
+  fully open-loop), so a cross-class comparison isolates the backbone rather than
+  confounding it with the control horizon. `horizon=56` (not 50) because the U-Net
+  needs a multiple of `2**len(down_dims)=8`. **Lowering `--policy.n_action_steps`
+  to ~8–16 turns on receding-horizon control** — DP's native mode, an
+  inference-time knob needing no retrain, and the first thing to try against the
+  **placement undershoot**, which is a consequence of committing to a long chunk.
+- **`n_obs_steps=1` is load-bearing, not a default** — the cleanup-DAgger relabel
+  (§4) is only valid for a purely state-conditioned policy, since a branched
+  episode's first frame has no real history. Don't raise it without re-reading §4.
+- **DDPM endpoint estimate.** π0's `a_hat = x_t − t·v_θ` becomes
+  `x̂₀ = (x_k − √(1−ᾱ_k)·ε_θ)/√ᾱ_k`. Note DDPM has **no convention flip** — noise
+  rises monotonically with `k`, so unlike π0 (see the footgun in
+  `safe_pi0_policy.py`'s docstring) small-k = data side reads the way you expect.
+  Two numerical caveats π0 doesn't have: the `1/√ᾱ_k` blow-up at high noise
+  (handled by the `(1−k/(T−1))` weighting, mirroring π0's `(1−t)`), and
+  `clamp_endpoint`, which clamps `x̂₀` to `±clip_sample_range` exactly as the DDPM
+  sampler does at every reverse step.
+- **⚠️ ACTION normalization differs between the classes**: `safe_pi0` inherits π0's
+  **MEAN_STD**, `safe_diffusion` uses DP's **MIN_MAX**. The safety loss must
+  un-normalize with the matching affine map before FK. Getting this wrong does not
+  crash — it feeds FK plausible garbage and silently penalises the wrong region of
+  space. Covered by `sim/tests/test_safe_diffusion.py` (`uv run pytest
+  sim/tests/test_safe_diffusion.py -q`, CPU, seconds), which also pins the
+  config↔policy naming contract LeRobot's factory resolves `--policy.type` through.
+- Sanity baseline (measured on `safe_cube_agg_v7.1` expert data, batch 32): FK
+  vs `privileged.ee_pos` **24 mm mean** (action is a joint *target* vs measured ee
+  — control lag, not error), ee z ∈ [0.010, 0.085] m, clearance mean 0.046 m,
+  `L_obstacle` 0.42, `L_ceiling` 0.61. Note the expert sits near the knee of the
+  ceiling penalty, so at `ceiling_weight=4` the expert data itself carries a
+  constant ~2.4 — worth a sweep now that sweeping is cheap.
+
 ---
 
 ## 3. Evaluate / rollout videos (use held-out seeds!)

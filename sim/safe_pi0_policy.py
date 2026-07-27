@@ -44,38 +44,16 @@ fine-tune.
 from __future__ import annotations
 
 import logging
-import sys
 from dataclasses import dataclass, field
 
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor
 
-
-# --- Python 3.14 + draccus argparse compatibility shim ----------------------
-# CPython 3.14 made argparse strict about ``type=`` being callable, but draccus
-# (≤ 0.11.x) still passes the raw ``X | None`` ``UnionType`` for Optional fields
-# (e.g. ``PI0Config.device``), which crashes parsing with
-# ``TypeError: str | None is not callable``. We collapse union types to their
-# first non-None member here before argparse sees them. Patching argparse's
-# ``_ActionsContainer.add_argument`` (the common base) catches both direct
-# parser calls and argument-group calls — draccus uses both. Active anywhere
-# ``safe_pi0`` is loaded (training and ``PolicyRollout`` both import this).
-if sys.version_info >= (3, 14):  # pragma: no cover - environment-specific
-    import argparse as _argparse
-    import typing as _typing
-
-    _orig_add_argument = _argparse._ActionsContainer.add_argument
-
-    def _add_argument_union_safe(self, *args, **kwargs):
-        t = kwargs.get("type")
-        if t is not None and not callable(t):
-            members = [a for a in _typing.get_args(t) if a is not type(None)]
-            kwargs["type"] = members[0] if members else str
-        return _orig_add_argument(self, *args, **kwargs)
-
-    _argparse._ActionsContainer.add_argument = _add_argument_union_safe
-
+# Must precede the lerobot imports below: patches argparse for draccus' `X | None`
+# types on Python 3.14. Shared with sim/safe_diffusion_policy.py (it is idempotent,
+# so importing both policy classes patches only once).
+import sim._draccus_compat  # noqa: F401
 
 from lerobot.configs import PreTrainedConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
