@@ -149,14 +149,20 @@ variety, clearance controls gripper safety. Don't re-couple them.
 
 ## 1. Collect data (scripted expert → BC dataset)
 
-`sim/scripts/collect_demos.py`. Current working command (8-cube weaving, clean):
+`sim/scripts/collect_demos.py`. Current working command (8-cube weaving, A* expert, clean):
 
 ```bash
 env -u DISPLAY MUJOCO_GL=egl PYTHONPATH=$PWD .venv/bin/python -m sim.scripts.collect_demos \
-  --repo-id local/safe-cube-mixed --root data/safe_cube_v5 \
+  --repo-id local/safe-cube-mixed --root data/safe_cube_v6 \
   --successes-only --n-red-cubes 8 --max-steps 500 --n-episodes 1600 --seed 0 \
-  > outputs/collect_v5.log 2>&1
+  --path-clearance-weight 1.0 \
+  > outputs/collect_v6.log 2>&1
 ```
+
+`--path-clearance-weight 1.0` enables the cost-field A* corridor planner, which bows expert
+paths toward the center of free gaps rather than hugging the clearance boundary (BFS default).
+λ=1.0 threads tight gaps; λ≥3 tends to route around the field — sweep if paths look timid.
+Add `--path-wall-field-sides` alongside a high λ to force through-field weaving.
 
 - **`--successes-only`** drops failures. `collect_demos` *also* unconditionally
   drops any `fly_over` episode (a demo of going *over* an obstacle is poison for
@@ -211,7 +217,8 @@ tmux new -s dagger_r1     # then, INSIDE the tmux session:
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=$PWD .venv/bin/python \
   -m sim.scripts.train_safe_pi0 \
   --policy.type=safe_pi0 --policy.pretrained_path=lerobot/pi0_base \
-  --policy.safety_weight=1.0 --policy.push_to_hub=false \
+  --policy.safety_weight=1.0 --policy.obstacle_weight=2.0 --policy.ceiling_weight=4.0 \
+  --policy.sdf_margin=0.02 --policy.push_to_hub=false \
   --policy.gradient_checkpointing=true \
   --dataset.repo_id=local/safe-cube-mixed --dataset.root=data/safe_cube_v5 \
   --output_dir=outputs/safe_pi0_bc --batch_size=48 --steps=20000 --save_freq=2000 \
@@ -234,9 +241,17 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=$PWD .venv/bin/pytho
   larger `--steps` (cosine window re-stretches).
 - **LR schedule:** `cosine_decay_with_warmup`, peak `2.5e-5`, **floor `2.5e-6`
   (10% of peak — NOT zero)**. Auto-scales the decay window when `steps < 30000`.
-- **`--policy.safety_weight` (λ) is the central knob — sweep it.** Too small →
-  safety ignored; too large → policy collapses to pure avoidance and stops doing
-  the task.
+- **Safety weighting is split into per-term knobs:** `--policy.obstacle_weight`
+  (lateral collision, default **2.0**) and `--policy.ceiling_weight` (stay-low,
+  default **4.0**), both scaled by the overall `--policy.safety_weight` (λ,
+  default 1.0). **Effective coeffs in the total loss: collision = λ·obstacle_weight
+  = 2.0, ceiling = λ·ceiling_weight = 4.0, flow = 1.0.** `--policy.sdf_margin=0.02`
+  is the clearance buffer. The stronger (2×) collision term is safe on **A*-collected
+  data** because the expert carries at max-available clearance, so the penalty fires
+  mostly off-distribution rather than on the expert (on the old BFS data it would
+  fight the expert's boundary-hugging — see memory). Sweep λ for overall safety
+  strength, or the per-term weights for balance. Too small → safety ignored; too
+  large → policy collapses to pure avoidance and stops doing the task.
 - **Loss is NOT a clean convergence signal** (non-stationary safety term + noisy
   flow-matching). **Early-stop at peak rollout *success*, not at min loss.**
 
@@ -247,15 +262,29 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=$PWD .venv/bin/pytho
 - `sim/scripts/record_policy_rollout.py` — render a trained checkpoint rolling out.
   **Its default `--seed 100` OVERLAPS training layouts (seeds 0..1599) and
   flatters the numbers** — pass `--seed 2000` (or any ≥ collection N).
-- **ALWAYS pass `--action-chunking`.** π0 is trained with `chunk_size=n_action_steps=50`;
+- **ALWAYS pass `--action-chunking`.** π0 is trained with `chunk_size=n_action_steps=30`
+  (overridden in `SafePI0Config`; the LeRobot upstream default is 50);
   the gripper close is a deferred mid-chunk event. Without this flag, `act()` resamples
   every step — the policy hovers at the cube and **never closes the jaws** (0% grasp,
-  0% success). `--action-chunking` uses `act_queued`, which executes the full 50-step
+  0% success). `--action-chunking` uses `act_queued`, which executes the full 30-step
   plan open-loop and re-infers only when the queue drains.
 - `sim.evaluate.evaluate()` reports success / red-contact / clearance / ceiling
   rates; wrap a checkpoint with `sim.dagger.PolicyRollout` and pass `.act_queued`
   with a per-episode `policy.reset()`.
 - `sim/scripts/record_rollout.py` — scripted-expert demo (the `videos/demo*` trio).
+- `sim/scripts/viz_cleanup_astar.py` — render stored cleanup-DAgger episodes from a
+  dataset with the **A* carry path projected onto the agentview frame**. Reads
+  `privileged.cube_positions`/`blue_cube_pos`/`goal_pos` from the parquet, re-plans
+  the A* path (λ=1.0, smooth-interior) from the episode's first frame, and overlays
+  it per-frame on the decoded video (yellow = ahead, olive = done, orange = current
+  target). Output is composite 960×480 (agentview + wrist). Cleanup v7.1 used λ=1.0
+  with smooth-interior (`path_clearance_interior_weight=11`, base=5).
+  ```bash
+  env -u DISPLAY MUJOCO_GL=egl PYTHONPATH=$PWD .venv/bin/python \
+    -m sim.scripts.viz_cleanup_astar \
+    --root data/safe_cube_cleanup_v7.1 --out videos/cleanup_v7.1_astar.mp4 \
+    --n-episodes 8
+  ```
 - All of these RENDER → run with `env -u DISPLAY MUJOCO_GL=egl`, and verify
   non-black.
 
@@ -358,6 +387,52 @@ marks the anchor frame (not part of this spec).
 - Fine-tune from the BC checkpoint, **low LR / fewer steps**, early-stop on rollout
   **success** (loss is not a clean signal — see §2).
 
+### Placement-anchor variant (`--anchor-mode place`) — same skeleton, different gate
+
+Same scout → anchor → pure-expert-relabel skeleton as the weave gate above; only
+the **trigger** and the **boundary-capture rule** change. It fixes the **open-loop
+placement undershoot** — the v7.1 policy drops the cube ~18 mm off-center, biased
+toward the arm base (`outputs/quantify_place_bias.log`), because it commits a
+50-step descend chunk and never corrects mid-chunk.
+
+**What triggers a branch (the key contrast with weave).** The weave gate fires on a
+*measured near-violation* — `grasped AND current_clearance() < gate_margin AND not
+at_goal` — a genuine danger event it has to hunt for. The place gate instead fires
+on a **distance band of the held cube → goal**
+(`collect_dagger_cleanup.py`, `off` at `:191`):
+
+```
+off = grasped AND place_tol < d_goal <= place_approach_radius
+```
+
+i.e. the grasped cube has entered the goal-approach band (≤ `--place-approach-radius`,
+default 0.10 m) but is **not yet centered** (> `--place-tol`, default 0.015 m).
+Rising-edge + cooldown, exactly like weave.
+
+**This is NOT a final-error threshold.** There is no "wait for the drop, measure
+the miss, branch if it exceeds X". Because the policy *reliably* undershoots, the
+rising edge fires the moment the grasped cube first comes within 0.10 m of the goal
+— so it anchors **every placement attempt**, not just the bad ones. That's
+deliberate: the weave gate has to *find* a rare near-collision (hence the live
+clearance measurement), but every placement is undershooting, so the place gate
+doesn't need to detect error — it just catches the policy *in the act of placing*
+and hands that on-policy approach state to the expert. The correction signal comes
+entirely from the **expert relabel** (a centered `DESCEND2` to within 7.5 mm),
+never from the gate quantifying how wrong the policy was.
+
+**Boundary capture is unconditional.** Both gates branch from the most-recent
+grasped **planning boundary** (`len(action_queue) == 0`), not the trigger frame
+(same chunked-policy reasoning as the weave gate — you can only correct a chunked
+policy at the state it *planned from*). But the weave gate only *caches* a boundary
+while the cube is far from goal (`d_goal > dropoff_radius`); the place gate caches
+one at **every** grasped re-plan, NOT distance-gated (`last_place_boundary` at
+`:156–163`) — because the chunk that ultimately lands off-center is often planned
+from *outside* the 0.10 m band (a 50-step chunk covers a lot of ground), so
+distance-gating the capture would routinely leave no boundary to branch from.
+
+`weave` and `place` cover **complementary regions** (far-from-goal vs near-goal),
+keep distinct boundary snapshots, and can run together with `--anchor-mode both`.
+
 **The pieces (all built — file/function map):**
 - `sim/env.py`:
   - `snapshot() -> dict` — copy `data.qpos/qvel/act/ctrl/time` **and** the
@@ -401,8 +476,31 @@ marks the anchor frame (not part of this spec).
 - Flags: `--gate-margin` (≈0.03 m), `--max-anchors` (≈3), `--cooldown-steps`
   (≈20), `--dropoff-radius` (≈0.05 m), optional `--branch-cap` (limit branch length
   past the anchor; default = run to completion), `--successes-only/--no-successes-only`
-  (default on), plus the usual `--checkpoint / --dataset-repo-id / --dataset-root /
+  (default on), `--path-clearance-weight` (A* λ, default 1.0), `--path-wall-field-sides`,
+  plus the usual `--checkpoint / --dataset-repo-id / --dataset-root /
   --repo-id / --root / --n-red-cubes / --max-steps / --seed / --n-workers / --vcodec`.
+- **`--anchor-mode {weave,place,both}`** (default `weave`, branch
+  `placement-anchor-dagger`). **`place`** is a second gate that fixes the **open-loop
+  placement undershoot** (the v7.1 policy drops the cube ~18 mm off-center, biased
+  toward the arm base — see `outputs/quantify_place_bias.log`). It anchors each
+  grasped *placement attempt* (cube within `--place-approach-radius`, default 0.10 m,
+  of the goal, off-center beyond `--place-tol`, default 0.015 m) at the most recent
+  grasped planning boundary — captured at **every** grasped re-plan, NOT
+  distance-gated (the placing chunk often originates outside the approach radius) —
+  and the pure expert relabels a **centered** drop (`DESCEND2` to within 7.5 mm).
+  Yield ≈1.3 clean branches/scout; branches are **short** (≈30–100 frames), and
+  `h264_nvenc` can fail to emit a file on the shortest clips → encode with
+  **SOFTWARE h264: `--vcodec h264 --gop 4`**. libx264 is robust on short clips,
+  and `--gop 4` makes the metadata (h264, g=4, crf=30, preset=None) an **exact
+  match to the `h264_nvenc`-collected BC set** so `aggregate_datasets` accepts it.
+  **Do NOT use `--vcodec libsvtav1` here** — it survives short clips but yields
+  **av1 g=2**, which fails `aggregate_datasets`' video-metadata equality check
+  against the h264 BC set (`validate_all_metadata: Same features is expected`).
+  Staged scripts: `outputs/run_place_cleanup.sh` (collect 800 branches,
+  seeds 4000+, from the v7.1 ckpt) → `outputs/run_train_place.sh` (aggregate
+  `safe_cube_agg_v7.1` + `safe_cube_place_cleanup` → `safe_cube_agg_place`, fine-tune
+  from the v7.1 cleanup ckpt at lr 1e-5 → `outputs/safe_pi0_place`). Early-stop on
+  rollout success **and** re-measured placement bias (`quantify_place_bias.py`).
 
 **Intended command** (held-out seeds ≥ collection N; `--dataset-*` = the BC set the
 checkpoint was trained on, for norm stats; `--repo-id/--root` = where the new
@@ -413,12 +511,13 @@ env -u DISPLAY MUJOCO_GL=egl PYTHONPATH=$PWD .venv/bin/python \
   -m sim.scripts.collect_dagger_cleanup \
   --repo-id local/safe-cube-cleanup --root data/safe_cube_cleanup \
   --checkpoint outputs/safe_pi0_bc_v6/checkpoints/last/pretrained_model \
-  --dataset-repo-id local/safe-cube-mixed --dataset-root data/safe_cube_v5 \
+  --dataset-repo-id local/safe-cube-mixed --dataset-root data/safe_cube_v6 \
   --n-red-cubes 8 --max-steps 500 --n-episodes 400 --seed 2000 \
-  --gate-margin 0.03 --max-anchors 3 --n-workers 4
+  --gate-margin 0.025 --max-anchors 3 --n-workers 4 \
+  --path-clearance-weight 1.0
 
 # then aggregate with the BC set and retrain (serial), as in §2:
-#   aggregate_datasets([safe_cube_v5, safe_cube_cleanup]) → data/safe_cube_v7
+#   aggregate_datasets([safe_cube_v6, safe_cube_cleanup]) → data/safe_cube_v7
 #   train_safe_pi0, resume from the BC v6 checkpoint, low LR, early-stop on success
 ```
 

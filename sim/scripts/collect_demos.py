@@ -44,13 +44,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--successes-only", action="store_true",
                    help="discard episodes that fail (red contact / drop / timeout)")
     p.add_argument("--use-videos", action="store_true", default=True)
+    # ── A* corridor planner ──────────────────────────────────────────────────
+    p.add_argument("--path-clearance-weight", type=float, default=1.0,
+                   help="A* soft-clearance weight λ: 0 = plain BFS; >0 = cost-field A* that "
+                        "bows corridors toward the center of free gaps. λ≈1 threads gaps; "
+                        "λ≥3 tends to route around the field instead of through it.")
+    p.add_argument("--path-clearance-pref", type=float, default=SceneConfig().path_clearance_pref,
+                   help="extra standoff (m) beyond the hard clearance radius the A* planner "
+                        "tries to keep (soft preference, not a hard constraint)")
+    p.add_argument("--path-wall-field-sides", action="store_true",
+                   help="hard-block lateral margins so A* weaves through the field rather "
+                        "than routing around it (use with high --path-clearance-weight)")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
-    scene = SceneConfig(mjcf_path=args.mjcf, n_red_cubes=args.n_red_cubes)
+    scene = SceneConfig(
+        mjcf_path=args.mjcf,
+        n_red_cubes=args.n_red_cubes,
+        path_clearance_weight=args.path_clearance_weight,
+        path_clearance_pref=args.path_clearance_pref,
+        path_wall_field_sides=args.path_wall_field_sides,
+    )
     env = SafeCubeEnv(EnvConfig(scene=scene, max_episode_steps=args.max_steps, seed=args.seed))
     # Reset once to lock in action_dim / state_dim.
     obs, info = env.reset(seed=args.seed)

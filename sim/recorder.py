@@ -166,6 +166,13 @@ class EpisodeRecorder:
         self.dataset.add_frame(frame)
         self._frames_in_episode += 1
 
+    @property
+    def frames_in_episode(self) -> int:
+        """Frames buffered in the current (not-yet-saved) episode. Lets a caller
+        discard a degenerate-short episode *before* save_episode() hands it to the
+        video encoder (some HW encoders fail on ultra-short clips)."""
+        return self._frames_in_episode
+
     def save_episode(self) -> int:
         n = self._frames_in_episode
         if n == 0:

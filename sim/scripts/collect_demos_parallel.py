@@ -53,7 +53,12 @@ def _collect_block(payload: dict) -> dict:
     base_seed = payload["base_seed"]
     ep_start, ep_end = payload["ep_start"], payload["ep_end"]
 
-    scene = SceneConfig(n_red_cubes=payload["n_red"])
+    scene = SceneConfig(
+        n_red_cubes=payload["n_red"],
+        path_clearance_weight=payload["path_clearance_weight"],
+        path_clearance_pref=payload["path_clearance_pref"],
+        path_wall_field_sides=payload["path_wall_field_sides"],
+    )
     env = SafeCubeEnv(EnvConfig(scene=scene, max_episode_steps=payload["max_steps"],
                                 seed=base_seed + ep_start))
     obs, _ = env.reset(seed=base_seed + ep_start)
@@ -108,6 +113,13 @@ def parse_args() -> argparse.Namespace:
                         "else 'libsvtav1' software. Pass an explicit codec to force it.")
     p.add_argument("--keep-shards", action="store_true",
                    help="don't delete the per-worker shard datasets after merge")
+    # ── A* corridor planner ──────────────────────────────────────────────────
+    p.add_argument("--path-clearance-weight", type=float, default=1.0,
+                   help="A* soft-clearance weight λ: 0=BFS, >0=cost-field A*")
+    p.add_argument("--path-clearance-pref", type=float, default=0.04,
+                   help="extra standoff (m) beyond the hard clearance radius")
+    p.add_argument("--path-wall-field-sides", action="store_true",
+                   help="hard-block lateral margins to force through-field weaving")
     return p.parse_args()
 
 
@@ -133,6 +145,9 @@ def main() -> None:
             repo_id=f"{args.repo_id}-part{i}", root=f"{root}_part{i}",
             n_red=args.n_red_cubes, max_steps=args.max_steps,
             successes_only=args.successes_only, vcodec=args.vcodec,
+            path_clearance_weight=args.path_clearance_weight,
+            path_clearance_pref=args.path_clearance_pref,
+            path_wall_field_sides=args.path_wall_field_sides,
         ))
 
     # Fresh shard dirs.

@@ -110,8 +110,16 @@ class SafePI0Config(PI0Config):
     knob — sweep it first.
     """
 
-    # Safety loss weighting and shape.
-    safety_weight: float = 1.0            # λ — task vs. safety trade-off
+    chunk_size: int = 50
+    n_action_steps: int = 50
+
+    # Safety loss weighting and shape. ``safety_weight`` (λ) is the OVERALL safety
+    # multiplier; ``obstacle_weight`` / ``ceiling_weight`` set the balance between
+    # the lateral-clearance and stay-low terms. Effective coeffs in the total loss:
+    #   collision = λ·obstacle_weight,  ceiling = λ·ceiling_weight,  flow = 1.0.
+    # Default = collision 1.0 (1·1), ceiling 4.0 (1·4).
+    safety_weight: float = 1.0            # λ — overall task vs. safety trade-off
+    obstacle_weight: float = 1.0          # weight of the lateral-clearance term within L_safety
     sdf_alpha: float = 50.0               # sigmoid sharpness (1/m)
     sdf_margin: float = 0.02              # desired clearance buffer (m)
     ee_radius: float = 0.03               # gripper bounding-sphere radius (m)
@@ -342,7 +350,7 @@ class SafePI0Policy(PI0Policy):
         ee_traj = self._fk_chunk(a_hat)              # (B, chunk, 3) world frame
         l_obstacle = self._safety_loss(ee_traj, batch, time)      # XY (lateral) cube avoidance
         l_ceiling = self._ceiling_loss(ee_traj, batch, time)      # stay-low / anti fly-over
-        l_safety = l_obstacle + self.config.ceiling_weight * l_ceiling
+        l_safety = self.config.obstacle_weight * l_obstacle + self.config.ceiling_weight * l_ceiling
 
         loss = l_flow + self.config.safety_weight * l_safety
 

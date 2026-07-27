@@ -2,7 +2,7 @@
 
 The replacement for the deprecated α-mixing DAgger
 (``sim.scripts.collect_dagger_parallel`` / ``sim.dagger.collect_dagger_round``),
-which regressed BC by stitching expert/policy actions *inside* π0's 50-step
+which regressed BC by stitching expert/policy actions *inside* π0's action
 chunk → incoherent ("Frankenstein") flow-matching targets. See CLAUDE.md §4 /
 README.md §3 for the full diagnosis.
 
@@ -16,8 +16,8 @@ label*, so no recorded chunk ever straddles two actors. Per episode:
 2. **Anchor (gate).** A **near-violation in the weave phase** —
    ``grasped`` AND ``env.current_clearance() < gate_margin`` AND the cube is not
    yet at the goal (``> dropoff_radius``) — *triggers* an anchor, but the snapshot
-   we keep is the **chunk-planning boundary**, not the danger frame. π0 executes a
-   50-step chunk open-loop, so a near-violation is the consequence of the chunk the
+   we keep is the **chunk-planning boundary**, not the danger frame. π0 executes an
+   action chunk open-loop, so a near-violation is the consequence of the chunk the
    policy planned at the last queue-refill (≤ chunk-length steps earlier); the only
    on-policy state a chunked policy can be corrected at is the one it *planned
    from*. So the scout snapshots each grasped weave-phase planning boundary
@@ -88,50 +88,79 @@ def scout_for_anchors(
     max_anchors: int,
     cooldown_steps: int,
     dropoff_radius: float,
+    anchor_mode: str = "weave",
+    place_tol: float = 0.015,
+    place_approach_radius: float = 0.10,
 ) -> list[dict]:
     """Roll the policy open-loop from ``env.reset(seed)`` and return snapshots to
     branch the expert from. The rollout is NOT recorded.
 
-    A near-violation = the cube is grasped, the ee is within ``gate_margin`` of a
-    red surface (``env.current_clearance()``), and the cube has not reached the
-    goal (XY distance to goal ``> dropoff_radius``) — which excludes the pre-grasp
-    pickup and the dropoff. It triggers on the rising edge only, suppresses
-    re-triggers for ``cooldown_steps`` env steps, and caps at ``max_anchors``.
+    Two anchor *gates*, selected by ``anchor_mode`` (``"weave"`` | ``"place"`` |
+    ``"both"``). Both branch from the **chunk-PLANNING boundary, not the trigger
+    frame**: π0 executes an action chunk open-loop, so a bad outcome is the
+    *consequence* of the chunk planned at the last queue-refill (≤ chunk-length
+    steps earlier). The only on-policy state a chunked policy can be corrected at
+    is the one it *planned from* (``len(action_queue) == 0`` → re-infer), so each
+    gate caches the most recent qualifying planning boundary and, on a rising-edge
+    trigger, branches from it. Relabeling the trigger frame, or the policy's
+    per-step path, would teach recovery-at-replan at best and reintroduce
+    incoherent ("Frankenstein") chunks at worst.
 
-    **The returned snapshot is the chunk-PLANNING boundary, not the danger frame.**
-    π0 executes a 50-step chunk open-loop; a near-violation is the *consequence* of
-    the chunk the policy planned at the last queue-refill (≤ chunk-length steps
-    earlier). To correct a chunked policy you must relabel the on-policy state it
-    *planned from* — the only place it can be corrected — so on each near-violation
-    we branch from the most recent grasped, weave-phase planning boundary
-    (``len(action_queue) == 0`` → re-infer), not the frame where the cube is
-    already next to the red. Relabeling the danger frame, or the policy's per-step
-    path, would teach recovery-at-replan at best and reintroduce incoherent chunks
-    at worst.
+    * **weave** — a *near-violation*: grasped, ee within ``gate_margin`` of a red
+      surface (``env.current_clearance()``), cube not yet at the goal (XY-to-goal
+      ``> dropoff_radius``, which excludes pickup and dropoff). Branches from the
+      most recent grasped, *far-from-goal* (``> dropoff_radius``) boundary → teaches
+      "weave clear". This is the original cleanup gate.
+    * **place** — a *placement attempt*: grasped and the cube has come within
+      ``place_approach_radius`` of the goal (but not already centered within
+      ``place_tol``). Branches from the most recent grasped planning boundary —
+      captured at *every* grasped re-plan, NOT distance-gated, because the placing
+      chunk that lands off-center is often planned from outside
+      ``place_approach_radius`` (a 50-step chunk covers a lot of ground), so gating
+      the capture would routinely leave no boundary to branch from. Teaches
+      "approach → centered drop": it targets the open-loop place undershoot (the
+      policy commits the placing chunk and releases before the reach completes,
+      landing consistently off-center), and the closed-loop expert re-centers to
+      within ``descend2_reach_tol`` before releasing, so the branch is a correct
+      centered-place relabel.
+
+    Rising-edge trigger + shared ``cooldown_steps`` + per-scout ``max_anchors`` cap
+    so one episode can't over-sample; ``last_anchored`` dedups re-triggers mapping
+    to the same boundary (weave and place boundaries are distinct snapshots).
     """
     obs, info = env.reset(seed=seed)
     policy.reset()
     goal_xy = np.asarray(info["goal_pos"], dtype=np.float64)[:2]
+    do_weave = anchor_mode in ("weave", "both")
+    do_place = anchor_mode in ("place", "both")
 
     snaps: list[dict] = []
-    prev_near = False
+    prev_near = prev_off = False
     cooldown = 0
     steps = 0
-    # Snapshot of the latest state the policy planned a chunk *from*, while grasped
-    # and still weaving (the frame a near-violation should be blamed on / branched
-    # from). last_anchored dedups re-triggers that map to the same boundary.
+    # Latest planning boundary each gate branches from (the state the offending
+    # chunk was planned at): weave = grasped & far from goal; place = grasped &
+    # near goal. last_anchored dedups re-triggers that map to the same boundary.
     last_boundary: dict | None = None
+    last_place_boundary: dict | None = None
     last_anchored: dict | None = None
     terminated = truncated = False
     while not (terminated or truncated) and steps < max_steps and len(snaps) < max_anchors:
         # Queue empty → this act_queued call re-infers a fresh chunk FROM the
         # current state. That state is what the policy plans from; capture it
-        # (cheap — snapshot() copies arrays, no render) if it's a weave-phase frame.
-        if len(policy.policy._action_queue) == 0:
-            if env._blue_grasped():
-                bx = env.blue_cube_position()[:2]
-                if float(np.linalg.norm(bx - goal_xy)) > dropoff_radius:
-                    last_boundary = env.snapshot()
+        # (cheap — snapshot() copies arrays, no render) per the active gate(s).
+        if len(policy.policy._action_queue) == 0 and env._blue_grasped():
+            d_goal_b = float(np.linalg.norm(env.blue_cube_position()[:2] - goal_xy))
+            if do_weave and d_goal_b > dropoff_radius:
+                last_boundary = env.snapshot()
+            if do_place:
+                # Capture EVERY grasped planning boundary (snapshot is cheap — array
+                # copies, no render). The placing chunk that lands off-center is
+                # often planned from *outside* place_approach_radius (a 50-step chunk
+                # covers a lot of ground), so distance-gating the capture would
+                # routinely leave no boundary to branch from. The near-goal gate is
+                # on the TRIGGER below; here we just keep the latest chunk origin.
+                last_place_boundary = env.snapshot()
 
         # act_queued pops one action from the open-loop chunk — the
         # deployment-distribution states we want to scout.
@@ -141,15 +170,32 @@ def scout_for_anchors(
 
         grasped = bool(info["grasped"])
         cube_xy = np.asarray(info["blue_cube_pos"], dtype=np.float64)[:2]
-        at_goal = float(np.linalg.norm(cube_xy - goal_xy)) <= dropoff_radius
-        near = grasped and not at_goal and env.current_clearance() < gate_margin
+        d_goal = float(np.linalg.norm(cube_xy - goal_xy))
+        at_goal = d_goal <= dropoff_radius
 
+        # weave near-violation (rising edge)
+        near = do_weave and grasped and not at_goal and env.current_clearance() < gate_margin
         if (near and not prev_near and cooldown <= 0
                 and last_boundary is not None and last_boundary is not last_anchored):
             snaps.append(last_boundary)
             last_anchored = last_boundary
             cooldown = cooldown_steps
         prev_near = near
+
+        # placement off-center (rising edge): grasped, within the approach band
+        # of the goal but still off-center (> place_tol). The band's upper bound is
+        # place_approach_radius (not dropoff_radius) so it fires on the descent
+        # wherever the policy commits to its off-center drop, not only in the last
+        # few cm — the grasped cube often doesn't dwell inside dropoff_radius before
+        # releasing.
+        off = do_place and grasped and place_tol < d_goal <= place_approach_radius
+        if (off and not prev_off and cooldown <= 0
+                and last_place_boundary is not None and last_place_boundary is not last_anchored):
+            snaps.append(last_place_boundary)
+            last_anchored = last_place_boundary
+            cooldown = cooldown_steps
+        prev_off = off
+
         if cooldown > 0:
             cooldown -= 1
     return snaps
@@ -177,8 +223,15 @@ def _collect_block(payload: dict) -> dict:
     max_steps = payload["max_steps"]
     branch_cap = payload["branch_cap"]
     successes_only = payload["successes_only"]
+    min_branch_frames = payload["min_branch_frames"]
+    target_branches = payload.get("target_branches")  # per-worker saved-branch cap
 
-    scene = SceneConfig(n_red_cubes=payload["n_red"])
+    scene = SceneConfig(
+        n_red_cubes=payload["n_red"],
+        path_clearance_weight=payload["path_clearance_weight"],
+        path_clearance_pref=payload["path_clearance_pref"],
+        path_wall_field_sides=payload["path_wall_field_sides"],
+    )
     # terminate_on_red_contact=False: the scout must keep rolling past finger
     # grazes to surface multiple near-violations, and a branch (which starts from
     # a near-violation) shouldn't die on the first graze — branch quality is
@@ -195,7 +248,12 @@ def _collect_block(payload: dict) -> dict:
         repo_id=payload["repo_id"], root=payload["root"], n_red_cubes=payload["n_red"],
         image_size=scene.image_size, action_dim=env.action_dim, state_dim=state_dim,
         fps=env.cfg.fps, use_videos=True,
-        camera_encoder=VideoEncoderConfig(vcodec=payload["vcodec"]),
+        # gop=None → VideoEncoderConfig default g (2; h264_nvenc auto-clamps to 4).
+        # Set --gop 4 with --vcodec h264 so software h264 matches an h264_nvenc BC
+        # set's metadata for aggregation.
+        camera_encoder=(VideoEncoderConfig(vcodec=payload["vcodec"], g=payload["gop"])
+                        if payload.get("gop") is not None
+                        else VideoEncoderConfig(vcodec=payload["vcodec"])),
         track_actor=False,
     )
     expert = ScriptedExpert(env=env, cfg=ExpertConfig())
@@ -220,6 +278,9 @@ def _collect_block(payload: dict) -> dict:
                 gate_margin=payload["gate_margin"], max_anchors=payload["max_anchors"],
                 cooldown_steps=payload["cooldown_steps"],
                 dropoff_radius=payload["dropoff_radius"],
+                anchor_mode=payload["anchor_mode"],
+                place_tol=payload["place_tol"],
+                place_approach_radius=payload["place_approach_radius"],
             )
         except RuntimeError:
             # sample_layout exhausted its attempts for this seed — skip it.
@@ -248,15 +309,24 @@ def _collect_block(payload: dict) -> dict:
             # set's distribution (the BC collector drops fly-overs and terminates
             # on red contact under --successes-only): drop fly-overs (poison for
             # the stay-low task) and finger-clip red contacts always, and drop
-            # non-successes under --successes-only.
+            # non-successes under --successes-only.  Also drop degenerate-short
+            # branches (a placement anchor restored right at the goal can finish in
+            # a handful of frames): they carry no useful training signal AND some HW
+            # encoders (h264_nvenc) fail on ultra-short clips inside save_episode().
+            too_short = rec.frames_in_episode < min_branch_frames
             clean = not stats["fly_over"] and not stats["red_contact"]
-            if clean and (stats["success"] or not successes_only):
+            if clean and not too_short and (stats["success"] or not successes_only):
                 rec.save_episode()
                 saved += 1
                 success += int(stats["success"])
             else:
                 rec.discard_episode()
                 discarded += 1
+        # Stop scouting once this worker has saved its share of the branch target.
+        # The seed block is sized generously (see main) so the target is reached
+        # before the block is exhausted; remaining seeds in the block go unused.
+        if target_branches is not None and saved >= target_branches:
+            break
     env.close()
     rec.finalize()
     return dict(wid=wid, scouts=scouts, anchors=anchors, saved=saved,
@@ -275,15 +345,33 @@ def parse_args() -> argparse.Namespace:
                         "stats / feature shapes to PolicyRollout (the BC set, not --repo-id)")
     p.add_argument("--dataset-root", type=str, default=None,
                    help="root of --dataset-repo-id on disk (needed for local/* datasets)")
-    p.add_argument("--n-episodes", type=int, default=400, help="number of scout episodes")
+    p.add_argument("--n-episodes", type=int, default=400,
+                   help="scout-episode budget (upper bound). With --target-branches this is "
+                        "just a generous cap; each worker stops early once it hits its branch share")
+    p.add_argument("--target-branches", type=int, default=None,
+                   help="stop once this many CLEAN branches are saved across all workers "
+                        "(each worker targets target/n_workers, then stops scouting). "
+                        "Set --n-episodes high enough that the seed block isn't exhausted first")
     p.add_argument("--n-red-cubes", type=int, default=8)
     p.add_argument("--seed", type=int, default=0,
                    help="scout N uses seed+N; keep ≥ collection N so layouts stay held out")
     p.add_argument("--max-steps", type=int, default=500)
     # ── Gate / anchor knobs ──────────────────────────────────────────────
-    p.add_argument("--gate-margin", type=float, default=0.03,
-                   help="near-violation clearance threshold (m): anchor when the grasped "
-                        "ee comes within this of a red surface during the weave")
+    p.add_argument("--anchor-mode", choices=("weave", "place", "both"), default="weave",
+                   help="which gate fires: 'weave' (near-red during the carry — the "
+                        "original cleanup gate), 'place' (off-center drop at the goal), "
+                        "or 'both'. 'place' targets the open-loop placement undershoot")
+    p.add_argument("--gate-margin", type=float, default=0.025,
+                   help="[weave] near-violation clearance threshold (m): anchor when the "
+                        "grasped ee comes within this of a red surface during the weave")
+    p.add_argument("--place-tol", type=float, default=0.015,
+                   help="[place] inner guard (m): don't anchor if the grasped cube is already "
+                        "within this of the goal center (already a centered drop)")
+    p.add_argument("--place-approach-radius", type=float, default=0.10,
+                   help="[place] trigger radius (m): anchor when the grasped cube first comes "
+                        "within this of the goal (a placement attempt). The branch point is "
+                        "the most recent grasped planning boundary — captured regardless of "
+                        "distance, since the placing chunk often originates farther out")
     p.add_argument("--max-anchors", type=int, default=3,
                    help="per-scout cap on anchors (branches), so one episode can't over-sample")
     p.add_argument("--cooldown-steps", type=int, default=20,
@@ -294,6 +382,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--branch-cap", type=int, default=None,
                    help="cap a branch's length (env steps past the anchor); default = run to "
                         "completion (--max-steps)")
+    p.add_argument("--min-branch-frames", type=int, default=8,
+                   help="discard branches shorter than this many frames before saving. Guards "
+                        "against degenerate-short placement anchors (restored right at the goal) "
+                        "that carry no signal and can crash HW encoders on ultra-short clips. "
+                        "Weave branches are long, so the default never bites them")
     p.add_argument("--successes-only", action=argparse.BooleanOptionalAction, default=True,
                    help="keep only branches that reach the goal (default on); "
                         "--no-successes-only keeps failed branches too")
@@ -303,9 +396,29 @@ def parse_args() -> argparse.Namespace:
                         "96 GB box (~72 GB + overhead), 5+ crowds the 75–85 GB target")
     p.add_argument("--vcodec", type=str, default="auto",
                    help="'auto' → first available HW encoder (h264_nvenc on NVIDIA), "
-                        "else 'libsvtav1' software. Pass an explicit codec to force it.")
+                        "else 'libsvtav1' software. Pass an explicit codec to force it. "
+                        "NOTE: --anchor-mode place branches are SHORT (~30-100 frames) and "
+                        "h264_nvenc can fail to emit a file on the shortest clips. For place "
+                        "mode use SOFTWARE h264 ('--vcodec h264 --gop 4'): libx264 is robust "
+                        "on short clips AND matches the h264_nvenc-collected BC set's video "
+                        "metadata (h264, g=4) so the cleanup set aggregates with it. "
+                        "('libsvtav1' also survives short clips but yields av1 g=2, which will "
+                        "NOT aggregate with an h264 BC set.)")
+    p.add_argument("--gop", type=int, default=None,
+                   help="override the encoder GOP size (keyframe interval). Leave unset for "
+                        "the VideoEncoderConfig default (g=2, which h264_nvenc auto-clamps to "
+                        "4). Set --gop 4 with '--vcodec h264' so software h264 matches an "
+                        "h264_nvenc BC set (which is g=4) for aggregation.")
     p.add_argument("--keep-shards", action="store_true",
                    help="don't delete the per-worker shard datasets after merge")
+    # ── A* corridor planner (used by the expert in each branch) ─────────────
+    p.add_argument("--path-clearance-weight", type=float, default=1.0,
+                   help="A* soft-clearance weight λ: 0 = plain BFS; >0 = cost-field A* "
+                        "that bows corridors toward gap centers (λ≥3 routes around the field)")
+    p.add_argument("--path-clearance-pref", type=float, default=0.04,
+                   help="extra standoff (m) beyond the hard clearance radius the planner prefers")
+    p.add_argument("--path-wall-field-sides", action="store_true",
+                   help="hard-block lateral margins so A* weaves through the field (use with high λ)")
     return p.parse_args()
 
 
@@ -325,6 +438,10 @@ def main() -> None:
     # Contiguous, disjoint blocks → seeds base..base+N-1 each scouted once.
     bounds = [round(i * N / K) for i in range(K + 1)]
     root = Path(args.root)
+    # Branch-count target: split evenly across workers (ceil so the sum ≥ target).
+    per_worker_target = (
+        -(-args.target_branches // K) if args.target_branches is not None else None
+    )
 
     payloads = []
     for i in range(K):
@@ -338,17 +455,31 @@ def main() -> None:
             n_red=args.n_red_cubes, max_steps=args.max_steps,
             gate_margin=args.gate_margin, max_anchors=args.max_anchors,
             cooldown_steps=args.cooldown_steps, dropoff_radius=args.dropoff_radius,
+            anchor_mode=args.anchor_mode, place_tol=args.place_tol,
+            place_approach_radius=args.place_approach_radius,
             branch_cap=args.branch_cap, successes_only=args.successes_only,
-            vcodec=args.vcodec,
+            min_branch_frames=args.min_branch_frames,
+            target_branches=per_worker_target,
+            vcodec=args.vcodec, gop=args.gop,
+            path_clearance_weight=args.path_clearance_weight,
+            path_clearance_pref=args.path_clearance_pref,
+            path_wall_field_sides=args.path_wall_field_sides,
         ))
 
     # Fresh shard dirs.
     for pl in payloads:
         shutil.rmtree(pl["root"], ignore_errors=True)
 
-    print(f"Launching {len(payloads)} workers × ~{N // K} scouts  "
-          f"(gate_margin={args.gate_margin}, max_anchors={args.max_anchors}, "
-          f"vcodec={args.vcodec}, n_red={args.n_red_cubes}, "
+    target_msg = (f"target={args.target_branches} branches ({per_worker_target}/worker), "
+                  f"≤{N // K} scouts/worker" if per_worker_target is not None
+                  else f"~{N // K} scouts/worker")
+    gate_msg = (f"gate_margin={args.gate_margin}" if args.anchor_mode == "weave"
+                else f"place_tol={args.place_tol},approach_r={args.place_approach_radius}"
+                if args.anchor_mode == "place"
+                else f"gate_margin={args.gate_margin},place_tol={args.place_tol}")
+    print(f"Launching {len(payloads)} workers × {target_msg}  "
+          f"(anchor_mode={args.anchor_mode}, {gate_msg}, max_anchors={args.max_anchors}, "
+          f"vcodec={args.vcodec}, gop={args.gop}, n_red={args.n_red_cubes}, "
           f"successes_only={args.successes_only})\n"
           f"  policy={args.checkpoint}\n"
           f"  stats from={args.dataset_repo_id} (root={args.dataset_root})", flush=True)
