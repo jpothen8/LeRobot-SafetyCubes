@@ -387,6 +387,52 @@ marks the anchor frame (not part of this spec).
 - Fine-tune from the BC checkpoint, **low LR / fewer steps**, early-stop on rollout
   **success** (loss is not a clean signal — see §2).
 
+### Placement-anchor variant (`--anchor-mode place`) — same skeleton, different gate
+
+Same scout → anchor → pure-expert-relabel skeleton as the weave gate above; only
+the **trigger** and the **boundary-capture rule** change. It fixes the **open-loop
+placement undershoot** — the v7.1 policy drops the cube ~18 mm off-center, biased
+toward the arm base (`outputs/quantify_place_bias.log`), because it commits a
+50-step descend chunk and never corrects mid-chunk.
+
+**What triggers a branch (the key contrast with weave).** The weave gate fires on a
+*measured near-violation* — `grasped AND current_clearance() < gate_margin AND not
+at_goal` — a genuine danger event it has to hunt for. The place gate instead fires
+on a **distance band of the held cube → goal**
+(`collect_dagger_cleanup.py`, `off` at `:191`):
+
+```
+off = grasped AND place_tol < d_goal <= place_approach_radius
+```
+
+i.e. the grasped cube has entered the goal-approach band (≤ `--place-approach-radius`,
+default 0.10 m) but is **not yet centered** (> `--place-tol`, default 0.015 m).
+Rising-edge + cooldown, exactly like weave.
+
+**This is NOT a final-error threshold.** There is no "wait for the drop, measure
+the miss, branch if it exceeds X". Because the policy *reliably* undershoots, the
+rising edge fires the moment the grasped cube first comes within 0.10 m of the goal
+— so it anchors **every placement attempt**, not just the bad ones. That's
+deliberate: the weave gate has to *find* a rare near-collision (hence the live
+clearance measurement), but every placement is undershooting, so the place gate
+doesn't need to detect error — it just catches the policy *in the act of placing*
+and hands that on-policy approach state to the expert. The correction signal comes
+entirely from the **expert relabel** (a centered `DESCEND2` to within 7.5 mm),
+never from the gate quantifying how wrong the policy was.
+
+**Boundary capture is unconditional.** Both gates branch from the most-recent
+grasped **planning boundary** (`len(action_queue) == 0`), not the trigger frame
+(same chunked-policy reasoning as the weave gate — you can only correct a chunked
+policy at the state it *planned from*). But the weave gate only *caches* a boundary
+while the cube is far from goal (`d_goal > dropoff_radius`); the place gate caches
+one at **every** grasped re-plan, NOT distance-gated (`last_place_boundary` at
+`:156–163`) — because the chunk that ultimately lands off-center is often planned
+from *outside* the 0.10 m band (a 50-step chunk covers a lot of ground), so
+distance-gating the capture would routinely leave no boundary to branch from.
+
+`weave` and `place` cover **complementary regions** (far-from-goal vs near-goal),
+keep distinct boundary snapshots, and can run together with `--anchor-mode both`.
+
 **The pieces (all built — file/function map):**
 - `sim/env.py`:
   - `snapshot() -> dict` — copy `data.qpos/qvel/act/ctrl/time` **and** the

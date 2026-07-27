@@ -91,6 +91,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-red-cubes", type=int, default=SceneConfig().n_red_cubes)
     p.add_argument("--seed", type=int, default=2000,
                    help="base seed (each ep gets seed + ep) — keep >= collection N (held out)")
+    p.add_argument("--seeds", type=int, nargs="+", default=None,
+                   help="explicit list of seeds to render (overrides --seed/--n-episodes); "
+                        "use to render specific scenarios, e.g. timeout layouts")
     p.add_argument("--max-steps", type=int, default=400)
     p.add_argument("--render-size", type=int, nargs=2, default=[480, 640],
                    help="(H W) of each per-camera frame")
@@ -295,11 +298,13 @@ def main() -> None:
     successes = contacts = ceilings = 0
     total_frames = 0
     wrist_cam_id = wrist_f_px = None  # computed after first reset
-    for ep in range(args.n_episodes):
-        obs, info = env.reset(seed=args.seed + ep)
+    seeds = args.seeds if args.seeds else [args.seed + ep for ep in range(args.n_episodes)]
+    n_eps = len(seeds)
+    for ep, ep_seed in enumerate(seeds):
+        obs, info = env.reset(seed=ep_seed)
         policy.reset()
         # Same seed -> identical layout. The expert drives this env independently.
-        g_obs, g_info = ghost_env.reset(seed=args.seed + ep)
+        g_obs, g_info = ghost_env.reset(seed=ep_seed)
         expert.reset()
         arm_ids = np.fromiter(ghost_env._arm_geom_ids, dtype=np.int64)
 
@@ -433,7 +438,7 @@ def main() -> None:
             stats = info["stats"]
             ee = info["ee_pos"]
             lines = [
-                (f"ep {ep + 1}/{args.n_episodes}   t={t:3d}   POLICY (white) vs EXPERT (cyan ghost)",
+                (f"ep {ep + 1}/{n_eps}   t={t:3d}   POLICY (white) vs EXPERT (cyan ghost)",
                  (255, 255, 255)),
                 (f"ee ({ee[0]:+.2f},{ee[1]:+.2f},{ee[2]:+.2f})   grasp={info['grasped']}   expert={g_phase}",
                  (200, 230, 255)),
@@ -443,8 +448,8 @@ def main() -> None:
                  (255, 200, 120) if not any([stats['red_contact'], stats['ceiling_violation'],
                                              stats['blue_dropped']]) else (80, 80, 255)),
             ]
-            agent_annot = _label(_overlay(agent_ghosted, lines), "agentview (+ ghost + BFS path)")
-            wrist_annot = _label(wrist_frame, "wrist_cam (policy + BFS path)")
+            agent_annot = _label(_overlay(agent_ghosted, lines), "agentview (+ ghost + A* path)")
+            wrist_annot = _label(wrist_frame, "wrist_cam (policy + A* path)")
 
             _write(agent_writer, cv2.cvtColor(agent_annot, cv2.COLOR_RGB2BGR))
             _write(wrist_writer, cv2.cvtColor(wrist_annot, cv2.COLOR_RGB2BGR))
@@ -478,8 +483,8 @@ def main() -> None:
         _close(comp_writer)
     env.close()
     ghost_env.close()
-    print(f"\nWrote {total_frames} frames over {args.n_episodes} episodes "
-          f"(success {successes}/{args.n_episodes}, red_contact {contacts}, ceiling {ceilings})")
+    print(f"\nWrote {total_frames} frames over {n_eps} episodes "
+          f"(success {successes}/{n_eps}, red_contact {contacts}, ceiling {ceilings})")
     print(f"  agentview:  {agent_path}")
     print(f"  wrist_cam:  {wrist_path}")
     if comp_writer is not None:
