@@ -188,8 +188,13 @@ def test_horizon_is_unet_compatible_and_covers_the_action_steps():
 
 
 def test_safety_knobs_mirror_safe_pi0_defaults():
-    """The coefficients must mean the same thing in both classes, so a λ sweep
-    run on the cheap policy transfers to π0."""
+    """The coefficients must mean the same thing in both classes.
+
+    NOTE this pins the *names and defaults*, not numerical transferability: the
+    same lambda is ~28x weaker on pi0 because its flow-matching loss is ~6.7x
+    larger in absolute scale (measured L_safety/L_task 0.027 vs 0.765). Port a
+    swept lambda by matching that ratio, not the raw value.
+    """
     from sim.safe_pi0_policy import SafePI0Config
 
     diff, pi0 = SafeDiffusionConfig(), SafePI0Config()
@@ -198,5 +203,34 @@ def test_safety_knobs_mirror_safe_pi0_defaults():
         "safety_time_weighting", "lateral_clearance", "ee_height_ceiling",
         "ceiling_alpha", "ceiling_weight", "ceiling_grasped_only",
         "urdf_path", "ee_link_name", "arm_joint_names",
+        # hinge form -- the collision geometry must match too, or a lambda swept
+        # on the cheap policy would not transfer to pi0.
+        "safety_form", "ceiling_buffer", "ee_to_cube_z_offset", "hinge_margin",
+        "held_cube_offset", "held_cube_radius", "ceiling_max_noise_frac",
+        "collision_links", "collision_offsets", "collision_radii",
+        "safety_max_noise_frac",
     ):
         assert getattr(diff, knob) == getattr(pi0, knob), f"{knob} diverged from safe_pi0"
+
+
+def test_noise_gate_zeroes_the_unreliable_high_k_samples():
+    """The endpoint estimate is only faithful near the data side.
+
+    At k=99 the DDPM 1/sqrt(alpha_bar) blow-up drives L_ceiling to ~38 where the
+    policy's real carry height gives ~0, so those samples must be excluded
+    outright — linear (1-k/K) weighting is far too weak to suppress them.
+    """
+    cfg = SafeDiffusionConfig(safety_max_noise_frac=0.25)
+    me = _fake_policy(cfg)
+    # frac = k / (num_train_timesteps - 1), so with K=100 the 0.25 gate cuts at k=24.
+    k = torch.tensor([0, 10, 50, 99]).long()
+    w = SafeDiffusionPolicy._time_weight(me, k, torch.float32)
+    assert w[0] > 0 and w[1] > 0            # inside the trusted band
+    assert w[2].item() == 0.0               # past it
+    assert w[3].item() == 0.0               # pure noise
+
+    # Default must stay a no-op so existing runs are bit-identical.
+    d = _fake_policy(SafeDiffusionConfig())
+    assert SafeDiffusionPolicy._time_weight(d, k, torch.float32)[3].item() == pytest.approx(0.0)
+    assert SafeDiffusionPolicy._time_weight(d, torch.tensor([50]).long(),
+                                            torch.float32)[0].item() > 0

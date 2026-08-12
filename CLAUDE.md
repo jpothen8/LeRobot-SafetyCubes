@@ -326,6 +326,342 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=$PWD .venv/bin/pytho
   ceiling penalty, so at `ceiling_weight=4` the expert data itself carries a
   constant ~2.4 — worth a sweep now that sweeping is cheap.
 
+### 2c. ⚠️ `safety_form=hinge` — the loss reform. Use it; don't sweep λ without it.
+
+**Do not sweep λ on the `softplus` form.** It is not a constraint on the policy,
+it is a competing objective: measured on ground-truth expert actions, the terms
+it reports are **314× the converged imitation loss**. λ=1 scored **82.7%** where
+λ=0 scored **95.2%** (Cell A vs Cell B, same data, 1000 held-out seeds), and λ=0
+also beats the best DAgger model (`cleanup_v7.1`, 92.7%) — so weave-DAgger's
++10 pp was substantially *repairing safety-loss damage*.
+
+Five defects, all measured by `sim/scripts/calibrate_safety_loss.py`:
+
+1. **Ceiling measured the wrong body.** `env.py:493-503` checks the **held cube's**
+   z, and its own comment warns the TCP "sits ~10 mm above the cube center and
+   would false-fire at normal carry heights." The loss fed it the FK
+   *gripper-frame* z against that same 0.035 → `L_ceiling` 0.585 on a policy with
+   **0/1000** env ceiling violations. Measured offset: exactly **10.0 mm**.
+2. **`softplus` never reaches zero.** At α=50, margin=0.02 the clearance must
+   exceed **0.112 m** for the penalty to drop below 0.01 — unreachable in a 0.30 m
+   field of 8 cubes. A constant repulsive field, not a violation detector.
+3. **Wrong collision geometry.** The env fires `red_contact` on any arm/finger geom
+   or the held cube; the loss queried **one 3 cm sphere at `gripper_frame_link`** —
+   a frame 9.8 cm beyond `gripper_link` carrying **no geometry at all**. Replaced
+   by a **91-sphere vertex covering of the gripper ends** (see below).
+4. **Lateral (XY) mode penalises legitimate reach/retreat** — `gripper_link` is
+   laterally inside a red prism on **4.7%** of expert frames. The hinge form uses
+   3D and leaves anti-fly-over to the (grasp-gated) ceiling term.
+5. **High-noise endpoint estimates dominate.** The safety term is evaluated on
+   `â₁`/`x̂₀`, which is an extrapolation at the noise side. Per pinned DDPM
+   timestep: `L_ceiling` = 0.00003 at k=0 but **38.8 at k=99** — reconstruction
+   noise, not behaviour. Linear `(1−t)` weighting is far too weak (0.01 × 38.8
+   still swamps it), so `safety_max_noise_frac` drops those samples outright.
+
+Effect on identical trained weights/batches (`safe_diffusion`, λ=0 reference):
+
+| form | `safety_max_noise_frac` | `l_obstacle` | `l_ceiling` | `L_safety` | vs `l_diffusion` |
+|---|---|---|---|---|---|
+| softplus | 1.0 (off) | 0.437 | 0.813 | 3.688 | **587×** |
+| softplus | 0.25 | 0.398 | 0.586 | 2.741 | 436× |
+| hinge | 1.0 (off) | 0.0024 | 0.246 | 0.987 | 157× |
+| **hinge** | **0.25** | **0.00067** | **0.00264** | **0.0112** | **1.8×** |
+
+**Both fixes are needed and they compose** (326× total). On ground-truth expert
+actions the hinge form measures `L_obstacle` **0.00062** / `L_ceiling` **0.0** =
+**0.07×** the imitation loss. That is the property that makes λ safe to sweep: a
+penalty that is ~0 at the demonstrations cannot distort the optimum, only
+off-distribution behaviour.
+
+**Always pass both flags together:**
+
+```bash
+  --policy.safety_form=hinge --policy.safety_max_noise_frac=0.25
+```
+
+Both default to the legacy values (`softplus` / `1.0`) so resuming an existing
+`train_config.json` is bit-identical — opting in is explicit. Other new knobs:
+`--policy.ceiling_buffer` (0.005 m band below the ceiling; the geometry forces
+this to stay narrow — the expert carries up to 30.3 mm and the ceiling is 35 mm),
+`--policy.ee_to_cube_z_offset` (0.010, measured), `--policy.hinge_margin` (0.005 —
+see below), and `collision_links/offsets/radii` (defaults in
+`sim/safety_geometry.py`, loaded from `sim/assets/collision_spheres.json`).
+
+#### The collision geometry — get this right or the margin is meaningless
+
+The query set is **91 spheres covering the gripper ends**, each the bounding
+sphere of a cluster of that geom's **actual mesh vertices**, so the union
+*contains* the arm. **Containment is the contract**: a sphere that is clear proves
+the real geom is clear, which is what lets `hinge_margin` be **0.005 m** rather
+than buying standoff. `sdf_margin=0.02` stays the *softplus* knob; the hinge form
+deliberately does not inherit it, because stacking 20 mm on top of a covering that
+already hugs the mesh would penalise the entire approach and retreat.
+
+Three things that were wrong here and are worth not repeating:
+
+- **Never size spheres from `geom_size`.** For a mesh that field is `max|v|` about
+  the **mesh origin** — not the bounding-box half-extent — so it is inflated by
+  however far the mesh sits off its own origin (`gripper_link` g25 reads 71.8 mm
+  in z for a 53.4 mm mesh). Compounding that, taking `max` of the two short axes
+  to size a sphere is >2× too fat for these plate-like parts (`wrist_link` g23 is
+  19.6 × 41.6 mm). Result: up to **19 mm over-conservative from one direction
+  while still reading thin from another** — a spread no scalar `--radius-shrink`
+  can remove. That is what `--sphere-source bbox` reproduces; don't use it.
+- **Verify per body, not just overall.** The aggregate check takes a min over all
+  spheres against a min over all geoms, so a body that is rarely the closest can
+  be badly mis-sized without moving the aggregate at all. The old set passed at
+  −0.4 mm median overall while `wrist_link` was −19.0 mm. `verify_spheres` now
+  prints a per-body table; read that one.
+- **`wrist_link` and the TCP frame are excluded on purpose.** Every `wrist_link`
+  sphere sits ≥97 mm from the TCP and it is the binding body on only 2.7% of
+  poses — it cannot reach a 25 mm cube. `gripper_frame_link` carries no geometry;
+  the held cube it used to stand in for is now `held_cube_clearance`, **gated on
+  `grasped`** (an ungated ball at the TCP is a phantom obstacle swept through the
+  field with an empty gripper) and at its **measured** rigid offset
+  `[-0.0045, -0.0123, 0.0018]` (0.7 mm spread). Measure that offset with FK of the
+  *observed* joints — FK of the action carries ~24 mm of control lag and reports a
+  spurious 21 mm.
+
+Current per-body bias vs `mj_geomDistance`: `gripper_link` **−2.4 mm**,
+`moving_jaw` **−3.3 mm** (was −11.3 / −6.1, and −19.0 on the dropped wrist).
+Sphere count is nearly free — 91 spheres costs the same 0.070 s/step at batch 64
+as the old 16 — so **do not trim further to save compute**: the residual bias acts
+as phantom standoff, and going to ~50 spheres pushes it back to ~6 mm, defeating
+the tight margin.
+
+- **See the geometry** before trusting it — `sim/scripts/viz_safety_spheres.py`
+  draws every sphere as a ghost ball coloured by hinge value (green clear → red
+  contact) over a real rollout, agentview + wrist:
+  ```bash
+  env -u DISPLAY MUJOCO_GL=egl PYTHONPATH=$PWD .venv/bin/python \
+    -m sim.scripts.viz_safety_spheres --out videos/safety_spheres.mp4 \
+    --n-episodes 3 --seed 2000
+  ```
+- **Regenerate / re-measure after any geometry change:**
+  ```bash
+  env -u DISPLAY MUJOCO_GL=egl PYTHONPATH=$PWD .venv/bin/python \
+    -m sim.scripts.calibrate_safety_loss --dataset-root data/safe_cube_agg_v7.1 \
+    --n-frames 20000 --derive-spheres
+  ```
+  Defaults reproduce the shipped asset (`--sphere-target-radius 0.012`,
+  `--spheres-per-geom 64`, `--sphere-max-tcp-dist 0.09`).
+- **Does it fire?** `sim/scripts/validate_safety_fires.py` rolls out a trained
+  checkpoint with `terminate_on_red_contact=False` and compares the per-frame
+  hinge value on real contact frames against clean ones — the necessary
+  complement to "≈0 on expert data", which an identically-zero loss would also
+  satisfy. It also prints **which geoms actually collide** (from the env's
+  `contact_history`), which is the empirical justification for the sphere set.
+  **D2 result** (60 rollouts of `safe_pi0_cleanup_v7.1`, seeds 20000+, held-out):
+
+  | | contact frames | clean frames |
+  |---|---|---|
+  | fires (hinge > 0) | **100.0%** | **0.4%** |
+  | mean hinge value | **2.574** | **0.0029** |
+  | min sphere clearance | −0.0039 m | +0.0440 m |
+
+  Median **5-frame lead** before contact (p90 7), so there is a gradient to act
+  on rather than a post-hoc flag. Together with ≈0 on expert data this is the
+  property `softplus` never had: silent where the expert operates, loud where the
+  policy actually crashes.
+
+  **Which bodies actually collide, and a correction to the note in §"Current scene
+  config".** That note says residual `red_contact` is "the wider gripper *finger*,
+  not the cube". That holds for the **scripted expert** (its BFS plans a clear
+  corridor for the *cube*), but does **not** transfer to a policy rollout, which
+  is the distribution the loss must constrain. Measured over 60 policy episodes:
+
+  Pooled over four checkpoints' rollout runs (462 contacts):
+
+  | body | contacts | share |
+  |---|---|---|
+  | `blue` (the **held cube**) | 259 | 56.1% |
+  | `moving_jaw_so101_v1_link` | 193 | 41.8% |
+  | `gripper_link` | 10 | 2.2% |
+  | `wrist_link` | **0** | — |
+
+  So (a) the held cube is a **leading** collision body, which is why
+  `held_cube_clearance` exists and must stay grasp-gated rather than dropped;
+  (b) `gripper_link` does appear, so keep it; and (c) zero `wrist_link` contacts
+  confirms the `--sphere-max-tcp-dist 0.09` trim.
+
+  Two traps here, both of which produced confidently wrong intermediate answers:
+  **resolve contacts by BODY, not geom name** (the arm's collision geoms are
+  unnamed meshes and all log as `?` in `contact_history`, which makes the cube
+  look totally dominant); and **pool across runs** — π0 rollouts are *stochastic*
+  (flow matching samples its initial noise), so a 40-episode run is NOT a subset
+  of a 60-episode one, and at ~3 contact episodes per run the body split swings
+  from 80/20 one way to 80/20 the other.
+
+- **D3 — does the loss rank checkpoints by measured safety?**
+  `sim/scripts/rank_checkpoints_by_safety.py` scores all four π0 checkpoints on
+  identical batches with paired flow-time draws, both forms on the same forward
+  pass, vs benchmark `red_contact` (seeds 10000-10999):
+
+  | form | term | ρ vs `red_contact` | |
+  |---|---|---|---|
+  | softplus | `l_obstacle` | −0.400 | |
+  | softplus | `l_ceiling` | **−1.000** | perfectly inverted |
+  | hinge | `l_obstacle` / `L_safety` | **+0.775** | 3 of 4 tied at exactly 0 |
+  | hinge | `l_ceiling` | NaN | all four tied at 0 |
+
+  The sign flips, which is the point — but **this is directional evidence, not a
+  significant result**: n=4 needs |ρ|=1.0 for p<0.05, and the hinge's +0.775 rests
+  on the worst model being the only non-zero score. That weakness is the direct
+  consequence of D1 (the loss is silent on expert states *by design*), so
+  expert-state batches can barely discriminate. **Use midrank ties** — plain
+  `argsort` invents an order for the tied zeros and reports a confident number
+  that is pure tie-breaking artifact.
+
+  The off-distribution version is `outputs/run_rank_rollouts.sh` →
+  `sim/scripts/rank_rollout_safety.py`, which ranks on continuous rollout
+  statistics (thousands of frames/checkpoint instead of one scalar):
+
+  | model | `red_contact` | mean hinge | % firing | clearance p5 |
+  |---|---|---|---|---|
+  | Cell B (λ=0) | 4.8% | 0.00188 | 0.74% | 0.0158 |
+  | r2_weave | 5.9% | 0.00675 | 0.84% | 0.0154 |
+  | cleanup_v7.1 | 6.1% | 0.00242 | 0.69% | 0.0154 |
+  | **Cell A (λ=1)** | **11.7%** | **0.06579** | **4.26%** | **0.0110** |
+
+  `mean_hinge` ρ = **+0.800**, `clear_p5` ρ = **−0.800** — both the wanted sign.
+  Read it this way: the middle three differ by 1.3 pp in `red_contact`, which
+  `compare_arms.py` shows is **not significant** (paired p = 0.193 / 0.289), so
+  ranking *those* is asking a metric to reproduce noise. The one significant
+  difference is Cell A vs the rest (p<0.001), and the reformed loss flags it by
+  **10-35×** on mean hinge. That is D3 passing in the only form it can be asked.
+
+#### Read the clearance TAIL, never its mean — this is how softplus fooled us
+
+`sim/scripts/aggregate_benchmark.py` now prints `min_clearance` percentiles and
+`frac<0.01m`, and `sim/scripts/compare_arms.py` does **paired** McNemar +
+Wilcoxon on the shared seeds (arms are benchmarked on the same layouts, so an
+unpaired test throws away the largest variance component). On the same 1000
+seeds:
+
+| | mean clearance | p1 | frac < 0.01 m | red_contact |
+|---|---|---|---|---|
+| Cell B (λ=0) | 0.028 m | 0.0120 | **0.3%** | 4.8% |
+| Cell A (λ=1, softplus) | **0.030 m** | 0.0079 | **1.8%** | 11.7% |
+
+Paired vs Cell B, Cell A scores: success **29w/154l (p<0.001)**, red_contact
+**33w/102l (p<0.001)**, median clearance **+2.1 mm (p<0.001)**. So the softplus
+term *significantly improved the quantity it penalises* (typical clearance) while
+*significantly increasing collisions* — a higher mean over a 6× worse danger tail.
+Textbook Goodhart, and the reason the hinge penalises only the near-violation tail
+and is identically 0 on the bulk. **Never report `mean_min_clear` alone.**
+
+#### ⚠️ The reformed loss can be silently INERT — check before every sweep
+
+A penalty engineered to be ~0 on the training distribution can end up ~0
+**everywhere**, contributing no gradient at all. Measured on the first sweep arms
+(`safe_diffusion`, converged): `l_obstacle` = **0.000000 on every training batch**,
+`L_safety/L_diffusion` = **0.000**. Every λ arm was therefore training identically
+and the sweep was measuring pure run-to-run noise. Two compounding causes:
+
+1. **`clearance_hinge_loss` averaged over spheres.** Safety is the *minimum*
+   clearance — one sphere buried in a cube is a collision however clear the other
+   91 are — but the reduction was `mean` over `(T, K)`, so a full contact
+   contributed `1/(T·K)` = 1/5152 to the sample loss. It also made the penalty
+   scale inversely with query-set size: going 16 → 91 spheres silently divided it
+   by ~6. **Fixed**: reduce over K by `amin` on clearance, keep `mean` over time.
+2. **One shared noise gate for both terms.** The two have *opposite* noise
+   sensitivity, so 0.25 cannot serve both:
+
+   | obstacle gate | ceiling gate | `l_obstacle` | `l_ceiling` | `L_safety/L_diff` |
+   |---|---|---|---|---|
+   | 0.25 | 0.25 | 0.000000 | 0.000000 | **0.000** (inert) |
+   | **1.00** | **0.25** | **0.000541** | 0.000000 | **0.765** ✓ |
+   | 1.00 | 1.00 | 0.000541 | 0.009680 | 28.1 (noise) |
+
+   The ceiling term is evaluated on the endpoint estimate and inflates **58×** as
+   the gate opens; the obstacle term is noise-robust and only becomes usable once
+   it does. Hence the separate **`--policy.ceiling_max_noise_frac`** (0.25), with
+   `--policy.safety_max_noise_frac` (the obstacle gate) at **1.0**.
+
+**`hinge_margin` must stay at 0.005**, and the reason is measured, not aesthetic.
+`L_obstacle` on ground-truth expert actions vs the converged imitation loss:
+
+| margin | 5 mm | 10 mm | 15 mm | 20 mm | 30 mm |
+|---|---|---|---|---|---|
+| ratio | **0.16×** | 1.13× | 4.23× | 9.91× | 32.2× |
+
+Anything ≥10 mm makes the penalty comparable to the imitation loss *on the
+demonstrations* — the exact defect the reform removed. At 5 mm the loss is 0.16×
+on expert actions but **0.765×** on the policy's own predictions: ~5× asymmetry,
+which is what makes λ meaningful rather than distortionary.
+
+**Before launching any sweep, verify the term is non-zero**: run a few batches
+through a trained checkpoint and check `l_obstacle > 0` on most of them. An
+inert loss produces a perfectly flat sweep that looks like a real null result.
+
+### 2d. The λ sweep RESULT — no sweet spot for success; a narrow one for margin
+
+`outputs/run_lambda_sweep.sh`, `safe_diffusion` + reformed loss, 100 k steps/arm,
+all arms benchmarked on the **same** 1000 held-out seeds (10000-10999), paired
+McNemar via `sim/scripts/compare_arms.py`:
+
+| λ | success | red_contact | paired p (success) | median clearance Δ | eps with clear<0.01 |
+|---|---|---|---|---|---|
+| 0 | 88.5% | 11.5% | — | — | 17/1000 |
+| **0.25** | 88.9% | 11.1% | **0.814** (flat) | −0.4 mm (p=0.123) | **4/1000 (p=0.0072)** |
+| 0.5 | 78.1% | 21.7% | <0.001 worse | −1.5 mm | 9/1000 (p=0.17) |
+| 1 | 63.6% | 36.4% | <0.001 worse | −2.9 mm | 12/1000 (p=0.44) |
+| 2 | 38.0% | 61.9% | <0.001 worse | −4.3 mm | 15/1000 |
+| 4 | **1.3%** | 77.0% | <0.001 worse | −7.9 mm | 128/1000 |
+
+**Answer to "is there a sweet spot, or is no safety loss better?"** For task
+success and collision *rate*: **no sweet spot — λ=0 is as good as it gets.** λ=0.25
+is statistically indistinguishable (p=0.814) and everything above is monotonically,
+massively worse. The one genuine win is narrow and specific: at λ=0.25 the
+**near-miss tail shrinks 4×** (17 → 4 episodes/1000 under 1 cm, p=0.0072) at no
+cost to success. So the reformed loss buys *clearance margin*, not success.
+
+**Why the window is so narrow — measured, and it is a training-dynamics problem,
+not a loss-shape problem.** Gradient norm at step 200: λ=0 → **3.5**, λ=1 →
+**77.0**, λ=4 → **260.4**. At λ≥1 the safety term dominates the gradient 20-70×
+*before the policy can fit the task*; with `optimizer_grad_clip_norm` the imitation
+signal is crushed. The policy never learns to place the cube (λ=4: 217/1000
+timeouts), flails, and therefore collides **more**. The rising `red_contact` at high
+λ is a symptom of a broken policy, not of the loss steering into obstacles.
+
+#### How to port a swept λ to another policy class (do NOT reuse the number)
+
+Two different invariants exist and they give different answers. Use the second.
+
+1. **Converged loss ratio `L_safety / L_task`** — tells you whether the penalty
+   distorts the *optimum*. Measured at identical geometry/margin/gates:
+   `safe_diffusion` **0.765** (92% of batches non-zero) vs π0 **0.027** (6%).
+   π0's flow-matching loss is ~6.7× larger in absolute scale (0.0096 vs 0.0014), so
+   the same λ is ~28× weaker there. Matching this ratio suggested λ=3.5 for π0.
+2. **Early grad-norm elevation vs the λ=0 run** — tells you whether the penalty
+   wrecks the *optimization path*, which is what the sweep showed actually kills
+   these runs. **This is the operative one.**
+
+`grad_norm` at step 200, `safe_diffusion`:
+
+| λ | grad_norm | × vs λ=0 | outcome |
+|---|---|---|---|
+| 0 | 3.54 | — | 88.5% |
+| **0.25** | 24.40 | **6.9×** | 88.9% + 4× smaller tail ✓ |
+| 0.5 | 43.36 | 12.2× | 78.1% ✗ |
+| 1 | 76.98 | 21.7× | 63.6% ✗ |
+
+λ=3.5 on π0 measured **80.95 vs Cell B's 3.41 = 23.8×** — already in the λ=1
+wreckage regime, killed at step 600. Backing λ out of the 6.9× target instead gives
+**λ≈1.0**, which measured **24.06 (7.1×)** — prediction confirmed. So: **calibrate a
+new policy class by matching the step-200 grad-norm elevation of the arm that
+worked, then verify at step 200 and abort if it overshoots.** Note grad_norm is
+above `optimizer_grad_clip_norm=1.0` even at λ=0 here, so absolute clipping is not
+the discriminator — the relative elevation is.
+
+⚠️ **Do not transfer this λ range to π0 without re-testing.** `safe_diffusion`
+trains **from scratch**, so early training is exactly where a randomly-initialised
+policy makes the safety term explode. π0 fine-tunes from `pi0_base` and starts
+competent, so the domination mechanism should be far weaker and the usable λ window
+correspondingly wider. The obvious follow-up given the diagnosis is a **λ warm-up**
+(hold λ=0 until the task loss converges, then ramp), which decouples the safety
+term from the from-scratch transient.
+
 ---
 
 ## 3. Evaluate / rollout videos (use held-out seeds!)

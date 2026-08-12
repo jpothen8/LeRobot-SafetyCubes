@@ -65,8 +65,19 @@ Two numerical caveats that ``safe_pi0`` does **not** have (flow matching's
 Everything else — the box SDF, the lateral-only clearance, the grasp-gated
 height ceiling, the ``privileged.*`` loss-only contract — is shared verbatim
 with ``safe_pi0``, so the coefficients (``safety_weight`` / ``obstacle_weight``
-/ ``ceiling_weight`` / ``sdf_margin``) mean the same thing in both classes and
-transfer between them.
+/ ``ceiling_weight`` / ``sdf_margin``) mean the same thing in both classes.
+
+**They do NOT transfer numerically.** The formula is shared; the *effective
+strength* is not, because the two imitation losses have different absolute scales.
+Measured on converged checkpoints at identical geometry, margin and gates::
+
+    safe_diffusion   L_safety / L_diffusion = 0.765   (92% of batches non-zero)
+    pi0              L_safety / L_flow      = 0.027   ( 6% of batches non-zero)
+
+pi0's flow-matching loss is ~6.7x larger in absolute terms (0.0096 vs 0.0014), so
+the same lambda is ~28x weaker relative to the objective it has to modify. Port a
+swept lambda by matching the **ratio** ``L_safety / L_task``, never the raw number:
+lambda=0.25 on safe_diffusion corresponds to lambda~3.5 on pi0. See CLAUDE.md 2d.
 """
 
 from __future__ import annotations
@@ -86,7 +97,20 @@ from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
-from sim.safety_geometry import FKChain, height_ceiling_loss, safety_loss, sdf_clearance
+from sim.safety_geometry import (
+    DEFAULT_COLLISION_LINKS,
+    DEFAULT_COLLISION_OFFSETS,
+    DEFAULT_COLLISION_RADII,
+    FKChain,
+    ceiling_hinge_loss,
+    clearance_hinge_loss,
+    collision_index,
+    collision_sphere_clearance,
+    height_ceiling_loss,
+    held_cube_clearance,
+    safety_loss,
+    sdf_clearance,
+)
 
 # Privileged batch keys written by sim.recorder.EpisodeRecorder. The policy never
 # feeds these to the network; only the safety loss reads them, and they are absent
@@ -166,6 +190,44 @@ class SafeDiffusionConfig(DiffusionConfig):
     ceiling_weight: float = 4.0           # weight of the height term within L_safety
     ceiling_grasped_only: bool = True     # only penalise height during carry (grasped)
 
+    # ---- penalty SHAPE (identical contract to safe_pi0; see that file's notes) --
+    # "softplus" is the original form, "hinge" the finite-support replacement.
+    # On expert data the softplus terms measure L_obstacle 0.391 / L_ceiling 0.585
+    # -- 314x the converged imitation loss -- so they compete with imitation
+    # rather than constraining it; the hinge forms measure 0.00062 / 0.0 (0.07x).
+    # Defaults to "softplus" so resuming an existing train_config.json is
+    # unchanged; pass --policy.safety_form=hinge to opt in.
+    safety_form: str = "softplus"         # "softplus" | "hinge"
+    ceiling_buffer: float = 0.005         # hinge band below the ceiling (m)
+    # Obstacle margin for the HINGE form only; see safe_pi0_policy.py for why it
+    # is ~4x tighter than sdf_margin (the sphere covering contains the arm, so it
+    # supplies its own standoff and does not need 20 mm stacked on top).
+    hinge_margin: float = 0.005           # obstacle hinge band (m)
+    # SEPARATE noise gate for the ceiling term; see safe_pi0_policy.py for the
+    # measured table. In short: sharing one gate at 0.25 made the OBSTACLE term
+    # exactly 0.0 on every training batch (no gradient, sweep measures nothing),
+    # while opening the gate to 1.0 inflates the CEILING term 58x with
+    # reconstruction noise. They need different gates.
+    ceiling_max_noise_frac: float = 0.25
+    # The carried blue cube, as a sphere in the TCP frame. Active only while
+    # `grasped`; see safety_geometry.held_cube_clearance for why both the gating
+    # and the non-zero offset matter.
+    held_cube_offset: tuple[float, float, float] = (-0.00452, -0.01232, 0.00178)
+    held_cube_radius: float = 0.0127      # blue cube half-extent (m)
+    # Drop the safety term for samples noisier than this fraction of the DDPM
+    # schedule. See safe_pi0_policy.py for the measured per-k table; in short,
+    # at k=99 the endpoint estimate's 1/sqrt(alpha_bar) blow-up makes L_ceiling
+    # 38.8 where the policy's real carry height would give ~0. 1.0 disables the
+    # gate (legacy behaviour); 0.25 keeps the term measuring behaviour.
+    safety_max_noise_frac: float = 1.0
+
+    ee_to_cube_z_offset: float = 0.010    # measured TCP-to-held-cube z gap
+    collision_links: list[str] = field(default_factory=lambda: list(DEFAULT_COLLISION_LINKS))
+    collision_offsets: list[list[float]] = field(
+        default_factory=lambda: [list(o) for o in DEFAULT_COLLISION_OFFSETS]
+    )
+    collision_radii: list[float] = field(default_factory=lambda: list(DEFAULT_COLLISION_RADII))
+
     # Forward-kinematics source. Must match the arm the dataset was recorded on.
     urdf_path: str = "sim/assets/so101/so101_new_calib.urdf"
     ee_link_name: str = "gripper_frame_link"
@@ -204,6 +266,17 @@ class SafeDiffusionPolicy(DiffusionPolicy):
 
         self._n_arm = len(config.arm_joint_names)
         self._fk = FKChain(config.urdf_path, config.ee_link_name, config.arm_joint_names)
+        self._sphere_links, self._sphere_index = collision_index(config.collision_links)
+        self.register_buffer(
+            "sphere_offsets",
+            torch.tensor(config.collision_offsets, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "sphere_radii",
+            torch.tensor(config.collision_radii, dtype=torch.float32),
+            persistent=False,
+        )
 
         action_dim = config.output_features[ACTION].shape[0]
         scale, offset = self._action_unnormalization(config, dataset_stats, action_dim)
@@ -306,17 +379,72 @@ class SafeDiffusionPolicy(DiffusionPolicy):
         The DDPM counterpart of ``safe_pi0``'s ``(1 - t)`` — and here the
         convention needs no flip, since noise rises monotonically with ``k``.
         """
-        if not self.config.safety_time_weighting:
-            return None
-        t_max = max(self.config.num_train_timesteps - 1, 1)
-        return 1.0 - timesteps.to(dtype) / t_max
+        cfg = self.config
+        t_max = max(cfg.num_train_timesteps - 1, 1)
+        frac = timesteps.to(dtype) / t_max
+        w = None if not cfg.safety_time_weighting else 1.0 - frac
+        if cfg.safety_max_noise_frac < 1.0:
+            gate = (frac <= cfg.safety_max_noise_frac).to(dtype)
+            w = gate if w is None else w * gate
+        return w
 
     # ----- safety terms (shared geometry with safe_pi0) ---------------------
+    def _raw_action(self, action_chunk_norm: Tensor) -> Tensor:
+        """Normalized action chunk -> raw joint targets, gripper dim included."""
+        return action_chunk_norm * self.action_scale + self.action_offset
+
     def _fk_chunk(self, action_chunk_norm: Tensor) -> Tensor:
         """Normalized action chunk -> world-frame ee trajectory ``(B, T, 3)``."""
-        raw = action_chunk_norm * self.action_scale + self.action_offset
+        raw = self._raw_action(action_chunk_norm)
         arm_q = raw[..., : self._n_arm]                                # drop gripper dim
         return self._fk.fk(arm_q)
+
+    def _hinge_terms(
+        self, raw_action: Tensor, ee_traj: Tensor, batch: dict[str, Tensor],
+        weight: Tensor | None, timesteps: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Finite-support obstacle + ceiling penalties. See ``safety_form``."""
+        cfg = self.config
+        b = ee_traj.shape[0]
+        centers = batch[PRIV_CUBE_POSITIONS].to(ee_traj.device, torch.float32).reshape(b, -1, 3)
+        halves = batch[PRIV_CUBE_HALF_EXTENTS].to(ee_traj.device, torch.float32).reshape(b, -1, 3)
+
+        clearance = collision_sphere_clearance(
+            self._fk, raw_action[..., : self._n_arm + 1], centers, halves,
+            links=self._sphere_links,
+            link_index=self._sphere_index.to(ee_traj.device),
+            offsets=self.sphere_offsets,
+            radii=self.sphere_radii,
+        )
+        # The carried cube is its own obstacle body while grasped.
+        tcp_mats = self._fk.fk_link_transforms(
+            raw_action[..., : self._n_arm + 1], ["gripper_frame_link"]
+        )[:, :, 0]
+        cube_clear = held_cube_clearance(
+            tcp_mats, centers, halves,
+            offset=torch.tensor(cfg.held_cube_offset, dtype=clearance.dtype),
+            radius=cfg.held_cube_radius,
+            grasped=batch.get(PRIV_GRASPED),
+        )
+        clearance = torch.cat([clearance, cube_clear], dim=-1)
+        l_obstacle = clearance_hinge_loss(clearance, margin=cfg.hinge_margin, weight=weight)
+
+        # The env checks the HELD CUBE's height, not the TCP's (env.py:493-503).
+        cube_z = ee_traj[..., 2] - cfg.ee_to_cube_z_offset
+        w = weight if weight is not None else torch.ones(
+            b, device=cube_z.device, dtype=cube_z.dtype
+        )
+        if cfg.ceiling_grasped_only:
+            grasped = batch.get(PRIV_GRASPED)
+            if grasped is not None:
+                w = w * grasped.to(cube_z.device, cube_z.dtype).reshape(b)
+        if cfg.ceiling_max_noise_frac < 1.0:
+            frac = timesteps.to(w.dtype) / max(1, cfg.num_train_timesteps - 1)
+            w = w * (frac <= cfg.ceiling_max_noise_frac).to(w.dtype)
+        l_ceiling = ceiling_hinge_loss(
+            cube_z, cfg.ee_height_ceiling, buffer=cfg.ceiling_buffer, weight=w
+        )
+        return l_obstacle, l_ceiling
 
     def _safety_loss(self, ee_traj: Tensor, batch: dict[str, Tensor], weight: Tensor | None) -> Tensor:
         if PRIV_CUBE_POSITIONS not in batch or PRIV_CUBE_HALF_EXTENTS not in batch:
@@ -416,8 +544,13 @@ class SafeDiffusionPolicy(DiffusionPolicy):
         a_hat = self._endpoint_estimate(noisy_trajectory, pred, timesteps)[..., :action_dim]
         ee_traj = self._fk_chunk(a_hat)                                # (B, horizon, 3) world frame
         weight = self._time_weight(timesteps, ee_traj.dtype)
-        l_obstacle = self._safety_loss(ee_traj, batch, weight)         # XY (lateral) cube avoidance
-        l_ceiling = self._ceiling_loss(ee_traj, batch, weight)         # stay-low / anti fly-over
+        if cfg.safety_form == "hinge":
+            l_obstacle, l_ceiling = self._hinge_terms(
+                self._raw_action(a_hat), ee_traj, batch, weight, timesteps
+            )
+        else:
+            l_obstacle = self._safety_loss(ee_traj, batch, weight)     # XY (lateral) cube avoidance
+            l_ceiling = self._ceiling_loss(ee_traj, batch, weight)     # stay-low / anti fly-over
         l_safety = cfg.obstacle_weight * l_obstacle + cfg.ceiling_weight * l_ceiling
 
         loss = l_diffusion + cfg.safety_weight * l_safety

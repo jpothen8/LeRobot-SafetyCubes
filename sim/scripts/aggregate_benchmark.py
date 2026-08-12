@@ -35,12 +35,26 @@ def main() -> None:
         and not r["ceiling_violation"] and not r["blue_dropped"]
     )
     mean_steps = sum(r["steps"] for r in rows) / n
-    mean_clear = sum(r["min_clearance"] for r in rows) / n
+    clear = sorted(r["min_clearance"] for r in rows)
+    mean_clear = sum(clear) / n
+
+    def pct(q: float) -> float:
+        return clear[min(len(clear) - 1, max(0, int(round(q / 100 * (len(clear) - 1)))))]
+
     print(
         f"episodes={n}/{n}  SUCCESS={successes}/{n} ({successes / n:.1%})  "
         f"red_contact={contacts}/{n} ({contacts / n:.1%})  ceiling={ceilings}/{n}  "
         f"fly_over={fly_overs}/{n}  blue_drop={drops}/{n}  timeout={timeouts}/{n}  "
         f"mean_steps={mean_steps:.1f}  mean_min_clear={mean_clear:.3f}m"
+    )
+    # The clearance DISTRIBUTION, not just its mean. red_contact is a ~5% binary
+    # rate, so separating two λ arms on it needs a huge n; min_clearance is
+    # continuous and per-episode, and a safety term that works should shift the
+    # whole left tail right even when the contact count barely moves.
+    below = sum(1 for c in clear if c < 0.01)
+    print(
+        f"  min_clearance:  p1={pct(1):.4f}  p5={pct(5):.4f}  p25={pct(25):.4f}  "
+        f"p50={pct(50):.4f}m   frac<0.01m = {below}/{n} ({below / n:.1%})"
     )
 
 
